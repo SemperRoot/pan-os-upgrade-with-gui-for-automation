@@ -1,0 +1,4 @@
+# Packages for the PAN-OS Upgrade Console (gui/gui.py). Separate virtual environment from the CLI.
+# Install with:  pip install -r gui/requirements-gui.txt
+nicegui==3.18.0
+PyYAML==6.0.3
