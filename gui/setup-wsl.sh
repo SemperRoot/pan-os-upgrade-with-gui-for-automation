@@ -63,6 +63,19 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
         "On WSL, install Ubuntu 24.04 (it has Python 3.12): in PowerShell run  wsl --install -d Ubuntu-24.04"
 ok "Python $(python3 -c 'import platform; print(platform.python_version())')"
 
+step "Checking the en_US.UTF-8 locale"
+# panos-upgrade-assurance switches to en_US.UTF-8 before every readiness check and fails with
+# "unsupported locale setting" if it isn't generated. WSL's Ubuntu often ships without it.
+locale_works() { python3 -c 'import locale; locale.setlocale(locale.LC_ALL, "en_US.UTF-8")' >/dev/null 2>&1; }
+if ! locale_works && command -v apt-get >/dev/null 2>&1; then
+    note "Generating en_US.UTF-8. If asked for a password, type your Ubuntu password."
+    dpkg -s locales >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y locales; }
+    sudo locale-gen en_US.UTF-8
+fi
+locale_works || fail "The en_US.UTF-8 locale isn't available." \
+    "Readiness checks fail without it. Generate it with: sudo locale-gen en_US.UTF-8"
+ok "en_US.UTF-8 available"
+
 step "Removing copied virtual-environment files that can't work here"
 # A copy of the project made on a Mac contains the Mac's virtual environment inside pan_os_upgrade/.
 # Only removed when it can't run on this machine, so a working local setup is never touched.
