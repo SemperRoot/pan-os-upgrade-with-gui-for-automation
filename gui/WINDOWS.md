@@ -243,7 +243,29 @@ continuing: see [Problems in Part 2](#problems-in-part-2).
 
 ## Part 3: Run the setup script
 
-The script installs everything and checks each step. It works from any folder.
+### 3.1 Install the US English locale
+
+The upgrade's readiness checks need Ubuntu's US English locale (`en_US.UTF-8`) to read dates in
+firewall output. WSL's Ubuntu often doesn't include it, and without it runs stop with
+`unsupported locale setting`.
+
+**In Ubuntu**, run these one at a time. The first one may ask for your Ubuntu password.
+
+```bash
+sudo apt install -y locales
+```
+
+```bash
+sudo locale-gen en_US.UTF-8
+```
+
+**You should see** `en_US.UTF-8... done` and then `Generation complete.` If the first command says
+`Unable to locate package locales`, run `sudo apt update` and try again.
+
+### 3.2 Run the setup script
+
+The script installs everything and checks each step, including the locale from 3.1. It works from
+any folder.
 
 **In Ubuntu:**
 
