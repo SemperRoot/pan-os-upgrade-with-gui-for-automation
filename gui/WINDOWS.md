@@ -442,6 +442,7 @@ Check again with `ls ~/pan-os-upgrade`.
 | Package downloads fail with `SSL`, `certificate` or `proxy` errors, or time out | Your network uses a proxy or inspects encrypted traffic, which is common on company networks. Ask IT for the proxy address and set it before running the script, for example `export https_proxy=http://proxy.example.com:8080`. IT may also need to provide a certificate. |
 | `error: externally-managed-environment` | You ran `pip install` by hand outside the project's environments. Don't; run the setup script instead. |
 | `pan-os-upgrade doesn't start` with `make_metavar` in the message | A wrong `click` version was installed. Run the setup script again; it installs the right one. |
+| `ERROR: The en_US.UTF-8 locale isn't available.` | Ubuntu couldn't set up the US English locale that readiness checks need. Run `sudo apt install -y locales`, then `sudo locale-gen en_US.UTF-8`, then run the setup script again. |
 
 ### Problems in Part 4
 
@@ -453,6 +454,7 @@ Check again with `ls ~/pan-os-upgrade`.
 | `address already in use` | The GUI is already running in another Ubuntu window, or another program uses port 8080. Close the other window, or start on another port: `PAN_OS_GUI_PORT=8081 bash ~/pan-os-upgrade/gui/start-gui.sh`, then open `http://localhost:8081`. |
 | The GUI works, but firewalls or Panorama can't be reached | Test from Ubuntu: `curl -k https://FIREWALL-ADDRESS` (an HTML reply means it's reachable). Company VPNs sometimes block WSL; [mirrored networking](#mirrored-networking) often fixes this. |
 | A message about not being able to open a browser | Normal on WSL. Open the address in your Windows browser yourself. |
+| A run stops with `generated an exception: unsupported locale setting` | Ubuntu is missing the US English locale that readiness checks need. Setups made before the setup script handled this are affected. Stop the GUI, run the setup script again (Part 3), and start the GUI again. If it's an HA pair, check both firewalls with `show high-availability state` before re-running, and make any member left `suspended` functional again. |
 
 #### Mirrored networking
 
@@ -476,6 +478,7 @@ and VPN problems. It needs Windows 11 version 22H2 or later.
 |-------|------|
 | Windows | WSL2 and Ubuntu 24.04 (Part 1). |
 | Ubuntu system packages | `python3` (3.12), `python3-venv`, `python3-pip`, `git`; plus `gh` (Option A) or `unzip` (Option B). |
+| Ubuntu locale | `en_US.UTF-8`, generated with `locale-gen` if missing. The readiness checks switch to it to read dates in firewall output. |
 | `~/pan-os-upgrade/.venv-cli` | The `pan-os-upgrade` CLI with the 32 packages pinned in [`requirements-cli.txt`](requirements-cli.txt), including `pan-os-python`, `panos-upgrade-assurance`, `typer` 0.9.4 and `click` 8.1.8. |
 | `~/pan-os-upgrade/gui/.venv` | The GUI's packages from [`requirements-gui.txt`](requirements-gui.txt): `nicegui` 3.18.0 and `PyYAML` 6.0.3, plus their own dependencies. |
 
@@ -484,6 +487,7 @@ The CLI and the GUI use separate environments, and nothing is installed into Ubu
 **Installing by hand** (only if you can't use the script), from inside `~/pan-os-upgrade`:
 
 ```bash
+sudo apt install -y locales && sudo locale-gen en_US.UTF-8
 python3 -m venv .venv-cli
 .venv-cli/bin/pip install -r gui/requirements-cli.txt
 .venv-cli/bin/pip install --no-deps .
