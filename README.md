@@ -70,11 +70,8 @@ Project Link: [https://github.com/cdot65/pan-os-upgrade](https://github.com/cdot
 
 Documentation Website: [https://cdot65.github.io/pan-os-upgrade/](https://cdot65.github.io/pan-os-upgrade/)
 
-YouTube Documentation:
 
-<a href="https://www.youtube.com/watch?v=5gdwIni3t9A" target="_blank">
-  <img src="https://github.com/cdot65/pan-os-upgrade/blob/main/docs/images/youtube.png?raw=true" alt="Video Thumbnail">
-</a>
+
 
 <!-- SUPPORT -->
 ## Support
