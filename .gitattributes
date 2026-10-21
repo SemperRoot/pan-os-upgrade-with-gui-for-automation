@@ -1,0 +1,2 @@
+# Shell scripts must keep Unix line endings, even when checked out with Git for Windows
+*.sh text eol=lf
