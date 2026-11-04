@@ -127,6 +127,23 @@ For a blocked jump, upgrade in stages, for example 10.0 → 10.1, then 10.1 → 
 - **Header badge and Output panel:** *Running*, *Awaiting input*, *Completed*, *Failed* or *Stopped*,
   plus elapsed time. The Output panel shows the CLI's log for both members together, each line
   prefixed with the device hostname.
+- **Monitoring → Upgrade tracker:** one row per device instead of one interleaved log. The GUI
+  opens it when a firewall, Panorama, batch or config backup run starts, and you can reopen any
+  saved run from the **Run** menu.
+  - **Tiles** count devices *In progress*, *Waiting* (queued, or an active member deferred to
+    round 2), *Done* and *Needs attention*. Click a tile to filter the table by it.
+  - **Filters:** HA role (active, passive, standalone), free-text search over device, stage and
+    message, and *Only with warnings or errors*.
+  - **Table:** HA role with a *Round 2* badge for deferred active members, a pause icon on members
+    this run suspended, status, current stage with a progress bar and time in that stage, the
+    latest message, versions, and warning and error counts.
+  - **Device details and log:** select a row to see its stages, versions, the reason it stopped,
+    its diff reports, and only that device's log lines, optionally just warnings and errors.
+  - **HA suspended banner:** lists every member the run suspended, so you know which ones need
+    `request high-availability state functional` afterwards.
+  - The tracker reads the CLI's console output; it doesn't query devices. A member already in
+    HA *suspended* state when the run starts is shown as *Not upgraded*: the CLI skips it without
+    logging why.
 - **Lines to look for:**
   - *Added target device to revisit list*: the active member was deferred to round 2.
   - *Suspending HA state of passive or active-secondary*: the passive member is starting its upgrade.

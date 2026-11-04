@@ -85,6 +85,7 @@ For details on the support provided by Palo Alto Networks for this project, plea
   - `firewall`: targets and upgrades an individual PAN-OS firewall
   - `panorama`: targets and upgrades an individual Panorama appliance
   - `batch`: targets a Panorama appliance and upgrades firewalls in bulk
+- **Standalone Configuration Backups**: `backup` exports the running configuration (and optionally the device state) of a firewall, or of the firewalls a Panorama appliance manages, to `assurance/backups/<hostname>/<timestamp>/`, without upgrading anything. It exits non-zero if any backup fails, so it can gate an upgrade: `pan-os-upgrade backup ... && pan-os-upgrade batch ...` With `--direct`, it connects to each firewall's management interface (addresses under `management_addresses` in `inventory.yaml`, same credentials on every firewall), which is required for device state exports.
 - **Automation of Routine Tasks**: Reduces manual errors and saves time by automating upgrades, configurations, and system checks.
 - **Support for Direct and Proxy Connections**: Connect directly to firewalls or through a Panorama appliance, with support for targeting specific devices using filters.
 - **Pre/Post Diff**: Network snapshots are taken before and after the upgrade process, providing a PDF report of changes within the network environment after the upgrade completes.

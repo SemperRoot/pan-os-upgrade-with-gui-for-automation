@@ -25,7 +25,7 @@ import shlex
 import signal
 import subprocess
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -39,6 +39,9 @@ os.environ.setdefault("NICEGUI_STORAGE_PATH", str(GUI_DIR / ".nicegui"))
 import yaml  # noqa: E402
 from nicegui import app, background_tasks, run, ui  # noqa: E402
 
+# local imports
+from tracker import STATUS_GROUPS, STATUSES, TERMINAL, DeviceTracker  # noqa: E402
+
 REPO_DIR = GUI_DIR.parent
 CLI_BIN = Path(
     os.environ.get(
@@ -49,6 +52,9 @@ WORKSPACE = Path(os.environ.get("PAN_OS_GUI_WORKSPACE", GUI_DIR / "workspace"))
 SETTINGS_PATH = WORKSPACE / "settings.yaml"
 INVENTORY_PATH = WORKSPACE / "inventory.yaml"
 CONSOLE_DIR = WORKSPACE / "console"
+BACKUPS_DIR = WORKSPACE / "assurance" / "backups"
+# A live batch upgrade warns about target firewalls without a backup this recent
+BACKUP_MAX_AGE = timedelta(hours=24)
 ASSURANCE_SOURCE = REPO_DIR / "pan_os_upgrade" / "components" / "assurance.py"
 GUIDE_PATH = GUI_DIR / "README.md"
 
@@ -64,6 +70,8 @@ GETPASS_NOISE = ("GetPassWarning: Can not control echo", "passwd = fallback_getp
 MAX_CONSOLE_LINES = 20000
 # Console capture files are named <YYYY-mm-dd_HH-MM-SS>_<command>.log by Runner.start
 CONSOLE_FILE_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(\w+)\.log$")
+# Commands whose output the Upgrade tracker can follow per device
+TRACKED_COMMANDS = ("firewall", "panorama", "batch", "backup")
 
 APP_NAME = "PAN-OS Upgrade Console"
 
@@ -132,6 +140,10 @@ body.body--dark .app-nav .q-item.app-nav-active { background: rgba(96, 165, 250,
 .app-doc pre code { background: none; border: none; color: inherit; padding: 0; }
 .app-doc blockquote { border-left: 3px solid #B26A00; background: rgba(178, 106, 0, .08); margin: 10px 0; padding: 8px 12px; border-radius: 0 6px 6px 0; }
 .app-doc-compact { font-size: 13px; }
+.app-tile { cursor: pointer; transition: border-color .15s; }
+.app-tile:hover { border-color: #94A3B8; }
+.app-tile-active { border-color: #0B5CAB !important; box-shadow: 0 0 0 1px #0B5CAB; }
+.app-tracker-table td { vertical-align: middle; }
 .app-doc-compact ul { margin: 0; }
 """
 
@@ -140,12 +152,14 @@ NAV = [
         ("firewall", "Firewall", "security"),
         ("panorama", "Panorama", "dns"),
         ("batch", "Batch upgrade", "view_list"),
+        ("backup", "Config backup", "save"),
     ]),
     ("Configuration", [
         ("inventory", "Inventory", "inventory_2"),
         ("settings", "Settings", "tune"),
     ]),
     ("Monitoring", [
+        ("tracker", "Upgrade tracker", "monitor_heart"),
         ("history", "Run history", "history"),
         ("logs", "Logs", "description"),
     ]),
@@ -205,6 +219,8 @@ class Runner:
         self.finished: Optional[datetime] = None
         self.exit_code: Optional[int] = None
         self.stopping = False
+        self.command = ""
+        self.tracker = DeviceTracker()
 
     @property
     def running(self) -> bool:
@@ -231,6 +247,8 @@ class Runner:
         self.description = description
         self.exit_code = None
         self.stopping = False
+        self.command = args[0]
+        self.tracker = DeviceTracker(kind="backup" if args[0] == "backup" else "upgrade")
 
         env = dict(os.environ, PYTHONUNBUFFERED="1", NO_COLOR="1", TERM="dumb", COLUMNS="200")
 
@@ -270,14 +288,22 @@ class Runner:
         self.finished = datetime.now()
         if self.partial:
             self.lines.append(self.partial)
+            if self.command in TRACKED_COMMANDS:
+                self.tracker.feed(self.partial, datetime.now())
             self.partial = ""
+        self.tracker.finish(self.exit_code, stopped=self.stopping)
         self.lines.append("")
         self.lines.append(f"Process exited with code {self.exit_code}")
 
     def _append(self, text: str):
         text = ANSI_ESCAPE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
         *complete, self.partial = (self.partial + text).split("\n")
-        self.lines.extend(line for line in complete if not any(noise in line for noise in GETPASS_NOISE))
+        complete = [line for line in complete if not any(noise in line for noise in GETPASS_NOISE)]
+        self.lines.extend(complete)
+        if self.command in TRACKED_COMMANDS:
+            now = datetime.now()
+            for line in complete:
+                self.tracker.feed(line, now)
         if len(self.lines) > MAX_CONSOLE_LINES:
             del self.lines[: len(self.lines) - MAX_CONSOLE_LINES]
 
@@ -364,11 +390,29 @@ def read_settings() -> dict:
     return {}
 
 
-def read_inventory() -> list[str]:
+def read_inventory_file() -> dict:
     if INVENTORY_PATH.exists():
         with open(INVENTORY_PATH) as f:
-            return (yaml.safe_load(f) or {}).get("firewalls_to_upgrade", []) or []
-    return []
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def read_inventory() -> list[str]:
+    return read_inventory_file().get("firewalls_to_upgrade", []) or []
+
+
+def read_management_addresses() -> dict[str, str]:
+    """Firewall hostname -> management address, for direct backups."""
+    return {str(k): str(v) for k, v in (read_inventory_file().get("management_addresses") or {}).items()}
+
+
+def write_inventory_section(key: str, data):
+    """Replace one section of inventory.yaml, keeping the others."""
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    inventory = read_inventory_file()
+    inventory[key] = data
+    with open(INVENTORY_PATH, "w") as f:
+        yaml.dump(inventory, f, default_flow_style=False, sort_keys=False)
 
 
 def tail(path: Path, lines: int = 500) -> str:
@@ -394,6 +438,29 @@ def console_runs() -> list[dict]:
             "size": f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B",
         })
     return sorted(rows, key=lambda row: row["started"], reverse=True)
+
+
+def latest_backups() -> dict[str, dict]:
+    """Newest successful backup of each device, from assurance/backups/<hostname>/<timestamp>/."""
+    found = {}
+    for host_dir in BACKUPS_DIR.iterdir() if BACKUPS_DIR.exists() else []:
+        runs = sorted(
+            (d for d in host_dir.iterdir() if d.is_dir() and (d / "running-config.xml").exists()), reverse=True
+        )
+        for run_dir in runs:
+            try:
+                taken = datetime.strptime(run_dir.name, "%Y-%m-%d_%H-%M-%S")
+            except ValueError:
+                continue
+            found[host_dir.name] = {"taken": taken, "path": run_dir, "files": sorted(f.name for f in run_dir.iterdir())}
+            break
+    return found
+
+
+def missing_recent_backups(hostnames: list[str]) -> list[str]:
+    backups = latest_backups()
+    cutoff = datetime.now() - BACKUP_MAX_AGE
+    return [h for h in hostnames if h not in backups or backups[h]["taken"] < cutoff]
 
 
 def value(element) -> str:
@@ -553,7 +620,9 @@ def execution_card(command: Callable[[bool], list[str]], start: Callable, mark: 
     return mode
 
 
-async def confirm_real_upgrade(details: list[tuple[str, str]], version: str, console_prompts: bool = False) -> bool:
+async def confirm_real_upgrade(
+    details: list[tuple[str, str]], version: str, console_prompts: bool = False, warnings: Optional[list[str]] = None
+) -> bool:
     with ui.dialog().props("persistent") as dialog, ui.card().props("flat").classes(
         "app-card w-[40rem] max-w-full p-0 gap-0"
     ):
@@ -585,6 +654,8 @@ async def confirm_real_upgrade(details: list[tuple[str, str]], version: str, con
                 "warning",
                 "device_hub",
             )
+            for warning in warnings or []:
+                notice(warning, "warning", "save")
             external = await run.io_bound(other_cli_processes)
             if external:
                 notice("Other pan-os-upgrade processes are already running:\n" + "\n".join(external), "warning")
@@ -604,15 +675,16 @@ async def confirm_real_upgrade(details: list[tuple[str, str]], version: str, con
     return bool(result)
 
 
-async def launch(args: list[str], stdin_lines: list[str], description: str):
+async def launch(args: list[str], stdin_lines: list[str], description: str) -> bool:
     if runner.running:
         ui.notify("A command is already running. Stop it or wait for it to finish.", type="warning")
-        return
+        return False
     if not CLI_BIN.exists():
         ui.notify(f"CLI not found: {CLI_BIN}", type="negative")
-        return
+        return False
     await runner.start(args, stdin_lines, description)
     ui.notify(f"Started: {description}", type="info")
+    return True
 
 
 def ha_guidance(first: str, second: str, navigate: Callable[[str], None], extra: Optional[list[str]] = None):
@@ -687,8 +759,9 @@ def firewall_page(navigate: Callable[[str], None]):
                        ("Target version", value(version))]
             if not await confirm_real_upgrade(details, value(version)):
                 return
-        await launch(command(dry), [password.value],
-                     f"firewall {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else ""))
+        if await launch(command(dry), [password.value],
+                        f"firewall {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else "")):
+            navigate("tracker")
 
     with side:
         execution_card(command, start, mark="firewall")
@@ -729,8 +802,9 @@ def panorama_page(navigate: Callable[[str], None]):
                 return
             # The panorama command has no --non-interactive flag; answer its "Dry Run?" prompt
             stdin_lines.append("n")
-        await launch(command(dry), stdin_lines,
-                     f"panorama {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else ""))
+        if await launch(command(dry), stdin_lines,
+                        f"panorama {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else "")):
+            navigate("tracker")
 
     with side:
         execution_card(command, start, mark="panorama")
@@ -818,22 +892,234 @@ def batch_page(navigate: Callable[[str], None]):
             devices = "\n".join(targets) if targets else "selected in the Output panel"
             details = [("Panorama", value(hostname)), ("Target version", value(version)),
                        (f"Firewalls ({len(targets)})" if targets else "Firewalls", devices)]
-            if not await confirm_real_upgrade(details, value(version), console_prompts=not targets):
+            missing = missing_recent_backups(targets)
+            warnings = [
+                f"No configuration backup from the last {int(BACKUP_MAX_AGE.total_seconds() // 3600)} hours for: "
+                f"{', '.join(missing)}. Run Operations → Config backup first, or continue without one."
+            ] if missing else []
+            if not await confirm_real_upgrade(details, value(version), console_prompts=not targets, warnings=warnings):
                 return
             if not targets:
                 # Interactive mode: answer the "Dry Run?" prompt; device selection and the final
                 # confirmation are answered in the Output panel
                 stdin_lines.append("n")
                 ui.notify("Pick devices in the Output panel, click Done, then confirm with Yes.", type="info")
-        await launch(command(dry), stdin_lines,
-                     f"batch via {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else ""))
+        if await launch(command(dry), stdin_lines,
+                        f"batch via {value(hostname)} -> {value(version)}" + (" (dry run)" if dry else "")):
+            navigate("tracker")
 
     with side:
         execution_card(command, start, mark="batch")
 
 
+def backup_page(navigate: Callable[[str], None]):
+    page_header("Operations", "Config backup",
+                "Save running configurations before an upgrade. Nothing on the devices changes.", "save")
+    form, side = operation_columns()
+    with form:
+        with card("Connection", "How to reach the firewalls", icon="hub"):
+            mode = remembered(
+                ui.toggle({"panorama": "Through Panorama", "direct": "Direct to firewalls"}, value="panorama").props(
+                    "spread no-caps unelevated toggle-color=primary"
+                ).classes("w-full").mark("backup-mode"),
+                "backup.mode",
+            )
+            panorama_note = notice(
+                "Connects to Panorama, or to a single firewall. Through Panorama, local administrator password "
+                "hashes come back masked and device state can't be downloaded.",
+                "info",
+                "dns",
+            )
+            direct_note = notice(
+                "Connects to each firewall's management interface, using the addresses on the Inventory page. "
+                "Every firewall must accept the same username and password.",
+                "warning",
+                "settings_ethernet",
+            )
+            hostname = remembered(
+                text_field("Firewall or Panorama hostname or IP", required=True, mark="backup-hostname"),
+                "backup.hostname",
+            )
+        with card("Devices", "Which firewalls to back up", icon="lan"):
+            inventory = remembered(
+                text_field(
+                    "Firewall hostnames, comma separated",
+                    hint="Optional. Names must match the hostnames in Panorama or on the Inventory page.",
+                    mark="backup-inventory",
+                ),
+                "backup.inventory",
+            )
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                source = notice("", "info", "checklist")
+                source.classes("grow")
+                ui.button("Edit inventory", icon="edit", on_click=lambda: navigate("inventory")).props(
+                    "flat no-caps"
+                ).classes("shrink-0")
+        with card("Options", "What to export from each device", icon="tune"):
+            device_state = remembered(ui.switch("Also export device state"), "backup.device_state")
+            ui.label(
+                "Device state includes the configuration Panorama pushes and the certificates. It needs a direct "
+                "connection to the firewall: through Panorama, the firewall creates the bundle but Panorama "
+                "doesn't send it back. To replace a managed firewall, Panorama can also generate the bundle itself "
+                "(Managed Devices → Summary → Export or push device config bundle)."
+            ).classes("text-xs app-muted -mt-3")
+            include_panorama = remembered(
+                ui.switch("Also back up Panorama's own configuration"), "backup.include_panorama"
+            )
+        with card("Credentials", "Passwords are never saved", icon="key"):
+            shared_credentials = ui.label(
+                "Direct mode signs in to every firewall with this username and password."
+            ).classes("text-sm app-muted")
+            with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-4 w-full"):
+                username, password = credential_inputs("backup")
+        with card("Latest backups", str(BACKUPS_DIR), icon="inventory"):
+            backups_table = ui.table(
+                rows=[],
+                columns=[
+                    {"name": "hostname", "label": "Device", "field": "hostname", "align": "left", "sortable": True},
+                    {"name": "taken", "label": "Taken", "field": "taken", "align": "left", "sortable": True},
+                    {"name": "age", "label": "Age", "field": "age", "align": "left"},
+                    {"name": "files", "label": "Files", "field": "files", "align": "left"},
+                ],
+                row_key="hostname",
+                pagination=10,
+            ).props("flat dense").classes("w-full")
+            backups_table.add_slot("body-cell-age", r"""
+                <q-td :props="props">
+                  {{ props.row.age }}
+                  <q-badge v-if="props.row.stale" color="warning" label="Older than 24 h" class="q-ml-xs" />
+                </q-td>""")
+            no_backups = ui.label("No backups yet.").classes("text-sm app-muted")
+
+    def field_targets() -> list[str]:
+        return [h.strip() for h in (inventory.value or "").split(",") if h.strip()]
+
+    def direct() -> bool:
+        return mode.value == "direct"
+
+    def direct_targets() -> tuple[list[str], list[str]]:
+        """(firewalls to back up, those of them without a management address) in direct mode."""
+        addresses = read_management_addresses()
+        targets = field_targets() or list(addresses)
+        return targets, [t for t in targets if t not in addresses]
+
+    def update_mode():
+        panorama_note.set_visibility(not direct())
+        direct_note.set_visibility(direct())
+        hostname.set_visibility(not direct())
+        include_panorama.set_visibility(not direct())
+        shared_credentials.set_visibility(direct())
+        update_device_source()
+
+    def update_device_source():
+        if direct():
+            targets, missing = direct_targets()
+            source.text_label.text = (
+                "No management addresses yet. Add them on the Inventory page." if not targets
+                else f"No management address for {', '.join(missing)}. Add it on the Inventory page." if missing
+                else f"{len(targets)} firewalls, connected directly"
+                + (" (from the field above)." if field_targets() else " (all firewalls with a management address).")
+            )
+        elif field_targets():
+            source.text_label.text = f"{len(field_targets())} firewalls from the field above."
+        elif read_inventory():
+            source.text_label.text = f"{len(read_inventory())} firewalls from the saved inventory."
+        else:
+            source.text_label.text = (
+                "No devices set. With Panorama, you will pick them from a table in the Output panel. "
+                "With a firewall, that firewall is backed up."
+            )
+
+    def refresh_backups():
+        now = datetime.now()
+        rows = []
+        for name, info in latest_backups().items():
+            age = now - info["taken"]
+            rows.append({
+                "hostname": name,
+                "taken": f"{info['taken']:%Y-%m-%d %H:%M}",
+                "age": f"{age.days}d {age.seconds // 3600}h" if age.days else f"{age.seconds // 3600}h {age.seconds % 3600 // 60}m",
+                "stale": age > BACKUP_MAX_AGE,
+                "files": ", ".join(info["files"]),
+            })
+        if rows != backups_table.rows:
+            backups_table.rows = rows
+            backups_table.update()
+        backups_table.set_visibility(bool(rows))
+        no_backups.set_visibility(not rows)
+
+    inventory.on_value_change(update_device_source)
+    mode.on_value_change(update_mode)
+    ui.timer(3, update_device_source)
+    ui.timer(10, refresh_backups)
+    update_mode()
+    refresh_backups()
+
+    def command() -> list[str]:
+        if direct():
+            args = ["backup", "--direct", "--username", arg(username, "username")]
+        else:
+            args = ["backup", "--hostname", arg(hostname, "hostname"), "--username", arg(username, "username")]
+        if field_targets():
+            args += ["--inventory", ",".join(field_targets())]
+        if device_state.value:
+            args.append("--device-state")
+        if include_panorama.value and not direct():
+            args.append("--include-panorama")
+        return args
+
+    async def start():
+        if direct():
+            if not validate_required(username, password):
+                return
+            targets, missing = direct_targets()
+            if not targets or missing:
+                ui.notify(source.text_label.text, type="negative")
+                return
+            description = f"direct backup of {len(targets)} firewalls"
+        else:
+            if not validate_required(hostname, username, password):
+                return
+            if not (field_targets() or read_inventory()):
+                ui.notify("If the target is Panorama, pick devices in the Output panel: enter numbers (e.g. 1,3-4), "
+                          "then click Done.", type="info")
+            description = f"backup via {value(hostname)}"
+        if await launch(command(), [password.value], description):
+            navigate("tracker")
+
+    with side:
+        with card("Execution", "Review the command before running it", icon="play_circle"):
+            notice(
+                "Read-only. Exports each device's running configuration and saves it to "
+                "assurance/backups/<hostname>/<time>/ in the workspace. Local administrator password hashes may "
+                "be masked; the run reports it.",
+                "info",
+                "save",
+            )
+            ui.label("Command").classes("app-overline")
+            preview = ui.label().classes("app-command w-full")
+            ui.label(
+                "The password is sent on stdin. It never appears on the command line or in saved settings."
+            ).classes("text-xs app-muted")
+            button = ui.button("Start backup", icon="save", on_click=start).props(
+                "unelevated no-caps color=primary"
+            ).classes("w-full h-11").mark("backup-run")
+
+    def refresh():
+        try:
+            preview.text = command_line(command())
+        except Exception:  # preview must never break the page
+            preview.text = "pan-os-upgrade backup ..."
+        button.set_enabled(not runner.running)
+        button.set_text("Another run is in progress" if runner.running else "Start backup")
+
+    ui.timer(0.5, refresh)
+    refresh()
+
+
 def inventory_page():
-    page_header("Configuration", "Inventory", "Firewalls targeted by batch upgrades.", "inventory_2")
+    page_header("Configuration", "Inventory",
+                "Firewalls targeted by batch upgrades and backups, and their management addresses.", "inventory_2")
     with ui.element("div").classes("grid grid-cols-1 lg:grid-cols-2 gap-4 w-full items-start"):
         with card("Upgrade inventory", str(INVENTORY_PATH), icon="list_alt"):
             editor = ui.textarea("One hostname per line", value="\n".join(read_inventory())).props(
@@ -864,15 +1150,52 @@ def inventory_page():
                 "unelevated no-caps"
             ).classes("self-end")
 
+        with card("Management addresses", "For direct backups: each firewall's management interface",
+                  icon="settings_ethernet"):
+            ui.label(
+                "One firewall per line: its hostname, a space, then an IP or DNS name of its management interface "
+                "that this computer can reach (for example a public or Elastic IP). Config backup's Direct mode "
+                "connects to these addresses with the same username and password on every firewall."
+            ).classes("text-sm app-muted")
+            addresses_editor = ui.textarea(
+                "hostname address", placeholder="fw-a 203.0.113.10\nfw-b 203.0.113.11",
+                value="\n".join(f"{k} {v}" for k, v in read_management_addresses().items()),
+                validation={"Each line needs a hostname and an address": lambda v: parse_addresses(v) is not None},
+            ).props("outlined rows=8").classes("w-full app-mono")
+            with ui.row().classes("w-full items-center gap-2"):
+                addresses_count = ui.chip("", icon="lan").props("outline dense")
+                addresses_unsaved = ui.chip("Unsaved changes", icon="edit", color="warning").props(
+                    "dense text-color=white"
+                )
+                ui.space()
+                ui.button("Save", icon="save", on_click=lambda: save_addresses()).props("unelevated no-caps")
+
+    def parse_addresses(text: str) -> Optional[dict[str, str]]:
+        parsed = {}
+        for line in (text or "").splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if len(parts) != 2:
+                return None
+            parsed[parts[0]] = parts[1]
+        return parsed
+
+    def save_addresses():
+        parsed = parse_addresses(addresses_editor.value)
+        if parsed is None:
+            ui.notify("Each line needs a hostname and an address, separated by a space.", type="negative")
+            return
+        write_inventory_section("management_addresses", parsed)
+        ui.notify(f"Saved {len(parsed)} management addresses to inventory.yaml", type="positive")
+
     state = {"saved": read_inventory()}
 
     def hostnames() -> list[str]:
         return [line.strip() for line in (editor.value or "").splitlines() if line.strip()]
 
     def save():
-        WORKSPACE.mkdir(parents=True, exist_ok=True)
-        with open(INVENTORY_PATH, "w") as f:
-            yaml.dump({"firewalls_to_upgrade": hostnames()}, f, default_flow_style=False)
+        write_inventory_section("firewalls_to_upgrade", hostnames())
         state["saved"] = hostnames()
         ui.notify(f"Saved {len(hostnames())} firewalls to inventory.yaml", type="positive")
 
@@ -887,6 +1210,9 @@ def inventory_page():
             reload()
         count.text = f"{len(hostnames())} firewalls"
         unsaved.set_visibility(hostnames() != state["saved"])
+        parsed = parse_addresses(addresses_editor.value)
+        addresses_count.text = f"{len(parsed)} addresses" if parsed is not None else "Invalid line"
+        addresses_unsaved.set_visibility(parsed != read_management_addresses())
 
     ui.timer(2, refresh)
     refresh()
@@ -1048,6 +1374,389 @@ def settings_page():
     refresh()
 
 
+STATUS_ORDER = ["failed", "interrupted", "not_upgraded", "running", "deferred", "queued", "dry_run", "completed",
+                "skipped"]
+ROLE_FILTERS = {"all": "All roles", "active": "Active", "passive": "Passive", "standalone": "Standalone"}
+ISSUE_EMOJI = ("\U0001f7e7", "❌", "\U0001f6d1")  # 🟧 ❌ 🛑, the CLI's warning, error and stop markers
+_saved_trackers: dict[str, tuple[float, DeviceTracker]] = {}
+
+
+def saved_run_tracker(name: str) -> DeviceTracker:
+    """Replay a saved console capture. Cached until the file changes."""
+    if runner.console_path and runner.console_path.name == name:
+        return runner.tracker
+    path = CONSOLE_DIR / name
+    mtime = path.stat().st_mtime
+    cached = _saved_trackers.get(name)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    match = CONSOLE_FILE_NAME.match(name)
+    tracker = DeviceTracker(kind="backup" if match and match.group(5) == "backup" else "upgrade")
+    tracker.feed_text(ANSI_ESCAPE.sub("", path.read_text(encoding="utf-8", errors="replace")))
+    tracker.finish()
+    _saved_trackers[name] = (mtime, tracker)
+    return tracker
+
+
+def duration(since: Optional[datetime]) -> str:
+    if not since:
+        return ""
+    seconds = int((datetime.now() - since).total_seconds())
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+
+
+def tracker_page():
+    actions = page_header("Monitoring", "Upgrade tracker",
+                          "Where each device is in an upgrade or backup run, read from the run's console output.",
+                          "monitor_heart")
+    with actions:
+        source = ui.select({}, label="Run").props("outlined dense stack-label options-dense").classes("w-80")
+        ui.button("Refresh", icon="refresh", on_click=lambda: refresh_sources()).props("flat no-caps")
+
+    with ui.row().classes("w-full items-center gap-3"):
+        run_status = ui.chip("", icon="radio_button_unchecked").props("dense text-color=white")
+        run_label = ui.label().classes("text-sm")
+        run_round = ui.label().classes("text-sm app-muted")
+        run_elapsed = ui.label().classes("text-sm app-muted app-mono")
+
+    empty = notice("", "info", "info")
+    suspended_note = notice("", "warning", "device_hub")
+
+    filters = {"group": "all", "role": "all", "search": "", "issues": False, "selected": None}
+    tiles = {}
+    with ui.element("div").classes("grid grid-cols-2 md:grid-cols-5 gap-4 w-full") as tile_grid:
+        for key, label, icon, color in (
+            ("all", "Devices", "dns", "primary"),
+            *((k, STATUS_GROUPS[k][0], i, c) for k, i, c in (
+                ("running", "sync", "info"), ("waiting", "hourglass_top", "secondary"),
+                ("done", "check_circle", "positive"), ("attention", "error", "negative"),
+            )),
+        ):
+            with ui.card().props("flat").classes("app-card app-tile p-4 gap-1").on(
+                "click", lambda k=key: set_filter("group", k)
+            ) as tile:
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.icon(icon, color=color).classes("text-lg")
+                    ui.label(label).classes("app-overline")
+                number = ui.label("0").classes("text-2xl font-semibold")
+            tiles[key] = (tile, number)
+
+    table_section = ui.column().classes("w-full")
+    with table_section, card():
+        with ui.row().classes("w-full items-center gap-3"):
+            role_filter = ui.toggle(ROLE_FILTERS, value="all", on_change=lambda e: set_filter("role", e.value)).props(
+                "no-caps unelevated dense toggle-color=primary"
+            )
+            search = ui.input(placeholder="Search device, stage or message").props(
+                "outlined dense clearable"
+            ).classes("w-72")
+            with search.add_slot("prepend"):
+                ui.icon("search")
+            search.on_value_change(lambda e: set_filter("search", (e.value or "").strip().lower()))
+            ui.switch("Only with warnings or errors", on_change=lambda e: set_filter("issues", e.value))
+            ui.space()
+            shown = ui.label().classes("text-sm app-muted")
+        table = ui.table(
+            rows=[],
+            columns=[
+                {"name": "hostname", "label": "Device", "field": "hostname", "align": "left", "sortable": True},
+                {"name": "role", "label": "HA role", "field": "role", "align": "left", "sortable": True},
+                {"name": "status", "label": "Status", "field": "order", "align": "left", "sortable": True},
+                {"name": "stage", "label": "Stage", "field": "stage_index", "align": "left", "sortable": True},
+                {"name": "activity", "label": "Latest activity", "field": "activity", "align": "left"},
+                {"name": "versions", "label": "Version", "field": "versions", "align": "left"},
+                {"name": "issues", "label": "Issues", "field": "issue_count", "align": "center", "sortable": True},
+            ],
+            row_key="hostname",
+            selection="single",
+            pagination={"rowsPerPage": 25, "sortBy": "status"},
+        ).props("flat dense").classes("w-full app-tracker-table").mark("tracker-table")
+        table.add_slot("body-cell-hostname", r"""
+            <q-td :props="props">
+              <div class="font-medium">{{ props.row.hostname }}</div>
+              <div class="text-xs app-muted">{{ props.row.address }}</div>
+            </q-td>""")
+        table.add_slot("body-cell-role", r"""
+            <q-td :props="props">
+              <span>{{ props.row.role }}</span>
+              <q-badge v-if="props.row.round == 2" color="secondary" label="Round 2" class="q-ml-xs" />
+              <q-icon v-if="props.row.ha_suspended" name="pause_circle" color="warning" size="xs" class="q-ml-xs">
+                <q-tooltip>HA suspended by this run. Not restored automatically.</q-tooltip>
+              </q-icon>
+            </q-td>""")
+        table.add_slot("body-cell-status", r"""
+            <q-td :props="props">
+              <q-badge :color="props.row.status_color" class="q-py-xs q-px-sm">
+                <q-icon :name="props.row.status_icon" size="14px" class="q-mr-xs" />{{ props.row.status_label }}
+              </q-badge>
+            </q-td>""")
+        table.add_slot("body-cell-stage", r"""
+            <q-td :props="props" style="min-width: 11rem">
+              <div class="row items-center no-wrap justify-between text-xs">
+                <span>{{ props.row.stage }}</span><span class="app-muted">{{ props.row.stage_for }}</span>
+              </div>
+              <q-linear-progress :value="props.row.progress" :color="props.row.status_color" rounded size="6px" />
+            </q-td>""")
+        table.add_slot("body-cell-activity", r"""
+            <q-td :props="props">
+              <div class="ellipsis" style="max-width: 19rem" :title="props.row.activity">{{ props.row.activity }}</div>
+              <div v-if="props.row.problem" class="ellipsis text-negative text-xs" style="max-width: 19rem"
+                   :title="props.row.problem">{{ props.row.problem }}</div>
+            </q-td>""")
+        table.add_slot("body-cell-issues", r"""
+            <q-td :props="props">
+              <q-badge v-if="props.row.warnings" color="warning" :label="props.row.warnings" class="q-mr-xs">
+                <q-tooltip>Warnings</q-tooltip></q-badge>
+              <q-badge v-if="props.row.errors" color="negative" :label="props.row.errors">
+                <q-tooltip>Errors</q-tooltip></q-badge>
+            </q-td>""")
+
+    with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-5 gap-4 w-full items-start") as detail_grid:
+        with ui.column().classes("xl:col-span-2 w-full"):
+            with card("Device details", "Select a device in the table", icon="router"):
+                details = ui.column().classes("w-full gap-3")
+        with ui.column().classes("xl:col-span-3 w-full"):
+            with card("Device log", "Only this device's lines from the run output", icon="terminal"):
+                with ui.row().classes("w-full items-center gap-3"):
+                    log_filter = ui.toggle({"all": "All lines", "issues": "Warnings and errors"}, value="all").props(
+                        "no-caps unelevated dense toggle-color=primary"
+                    )
+                    ui.space()
+                    follow = ui.switch("Follow", value=True)
+                with ui.scroll_area().classes("app-terminal w-full h-[40vh]") as scroller:
+                    device_log = ui.label().classes("app-mono whitespace-pre-wrap text-xs")
+
+    state = {"key": None, "detail_key": None, "log_key": None}
+
+    def current_tracker() -> Optional[DeviceTracker]:
+        if source.value == "current":
+            return runner.tracker if runner.command in TRACKED_COMMANDS else None
+        if source.value:
+            try:
+                return saved_run_tracker(source.value)
+            except OSError:
+                return None
+        return None
+
+    def refresh_sources():
+        options = {}
+        if runner.command in TRACKED_COMMANDS:
+            options["current"] = f"Current run: {runner.description}"
+        for row in console_runs():
+            if row["command"] in TRACKED_COMMANDS:
+                options[row["id"]] = f"{row['started']} · {row['command']}"
+        source.set_options(options)
+        if source.value not in options:
+            source.value = next(iter(options), None)
+        state["key"] = None
+        refresh()
+
+    def set_filter(name: str, val):
+        filters[name] = val
+        state["key"] = None
+        refresh()
+
+    def matches(device, upgrade: bool) -> bool:
+        if filters["group"] != "all" and device.status not in STATUS_GROUPS[filters["group"]][1]:
+            return False
+        if upgrade and filters["role"] != "all" and device.role_group != filters["role"]:
+            return False
+        if filters["issues"] and not (device.warnings or device.errors):
+            return False
+        needle = filters["search"]
+        if needle and not any(needle in str(v).lower() for v in (
+            device.hostname, device.ip, device.serial, device.stage, device.activity, device.problem,
+            STATUSES[device.status][0],
+        )):
+            return False
+        return True
+
+    def row(tracker: DeviceTracker, device) -> dict:
+        label, color, icon = STATUSES[device.status]
+        versions = device.current_version or "?"
+        if device.target_version and device.target_version != device.current_version:
+            versions += f" → {device.target_version}"
+        live = device.status not in TERMINAL
+        return {
+            "hostname": device.hostname,
+            "address": " · ".join(v for v in (device.ip, device.serial) if v),
+            "role": device.role or "unknown",
+            "round": device.round,
+            "ha_suspended": device.ha_suspended,
+            "order": STATUS_ORDER.index(device.status),
+            "status_label": label,
+            "status_color": color,
+            "status_icon": icon,
+            "stage": device.stage,
+            "stage_index": tracker.stages.index(device.stage),
+            "stage_for": duration(device.stage_since) if live else "",
+            "progress": tracker.progress(device),
+            "activity": device.activity,
+            "problem": "" if device.problem in device.activity else device.problem,
+            "versions": versions,
+            "warnings": device.warnings,
+            "errors": device.errors,
+            "issue_count": device.warnings + device.errors,
+        }
+
+    def refresh():
+        tracker = current_tracker()
+        is_current = source.value == "current"
+
+        if is_current:
+            label, color, icon = runner.status()
+            run_status.text = label
+            run_status.props(f"color={color} icon={icon}")
+            run_label.text = runner.description
+            run_elapsed.text = runner.elapsed()
+        else:
+            finished_label = "Saved run" if source.value else "No runs"
+            run_status.text = finished_label
+            run_status.props("color=grey-7 icon=history")
+            run_label.text = str(CONSOLE_DIR / source.value) if source.value else ""
+            run_elapsed.text = ""
+        run_round.text = f"Round {tracker.round} of 2" if tracker and tracker.devices and tracker.kind == "upgrade" else ""
+
+        has_devices = bool(tracker and tracker.devices)
+        empty.text_label.text = (
+            "No upgrade or backup runs yet. Start one from the Operations pages and follow it here."
+            if not source.value
+            else "Waiting for the CLI to report devices..." if tracker and not tracker.finished
+            else "This run didn't report any devices."
+        )
+        empty.set_visibility(not has_devices)
+        tile_grid.set_visibility(has_devices)
+        detail_grid.set_visibility(has_devices)
+        table_section.set_visibility(has_devices)
+
+        suspended = tracker.suspended() if tracker else []
+        suspended_note.set_visibility(bool(suspended))
+        if suspended:
+            suspended_note.text_label.text = (
+                f"HA was suspended on {len(suspended)} device(s) by this run: {', '.join(suspended)}. The CLI never "
+                "restores it. When the run is finished, check show high-availability state and run "
+                "request high-availability state functional on each member left suspended."
+            )
+
+        # Only rebuild the table when something changed; durations tick every 5 seconds on a live run
+        live_tick = int(datetime.now().timestamp() // 5) if is_current and runner.running else 0
+        key = (id(tracker), tracker.version if tracker else -1, live_tick, tuple(sorted(filters.items(), key=str)))
+        if key == state["key"]:
+            refresh_detail(tracker)
+            return
+        state["key"] = key
+
+        # HA role and versions only mean something in upgrade runs
+        upgrade = not tracker or tracker.kind == "upgrade"
+        role_filter.set_visibility(upgrade)
+        table.props["visible-columns"] = [c["name"] for c in table.columns
+                                          if upgrade or c["name"] not in ("role", "versions")]
+
+        devices = list(tracker.devices.values()) if tracker else []
+        counts = {"all": len(devices)}
+        for group, (_, statuses) in STATUS_GROUPS.items():
+            counts[group] = sum(d.status in statuses for d in devices)
+        for group, (tile, number) in tiles.items():
+            number.text = str(counts[group])
+            tile.classes(add="app-tile-active") if filters["group"] == group else tile.classes(remove="app-tile-active")
+
+        visible = sorted((d for d in devices if matches(d, upgrade)), key=lambda d: (STATUS_ORDER.index(d.status), d.hostname))
+        rows = [row(tracker, d) for d in visible]
+        table.rows = rows
+        if not tracker or filters["selected"] not in tracker.devices:
+            # Start on the device most in need of attention
+            filters["selected"] = rows[0]["hostname"] if rows else None
+        selected = filters["selected"]
+        table.selected = [r for r in rows if r["hostname"] == selected]
+        table.update()
+        shown.text = f"Showing {len(rows)} of {len(devices)}"
+        refresh_detail(tracker)
+
+    def refresh_detail(tracker: Optional[DeviceTracker]):
+        device = tracker.devices.get(filters["selected"]) if tracker and filters["selected"] else None
+        detail_key = (id(tracker), filters["selected"], tracker.version if tracker else -1, device is None)
+        if detail_key != state["detail_key"]:
+            state["detail_key"] = detail_key
+            details.clear()
+            with details:
+                if device is None:
+                    ui.label("Select a device in the table to see its stages and log.").classes("text-sm app-muted")
+                else:
+                    label, color, icon = STATUSES[device.status]
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label(device.hostname).classes("text-lg font-semibold")
+                        ui.chip(label, icon=icon, color=color).props("dense text-color=white")
+                    if device.problem:
+                        notice(device.problem, "negative" if device.status == "failed" else "warning", "report")
+                    with ui.element("div").classes("app-kv w-full"):
+                        upgrade = tracker.kind == "upgrade"
+                        for key, val in (
+                            ("HA role", device.role or ("unknown" if upgrade else "")),
+                            ("Round", f"{device.round}" + (" (deferred active member)" if device.round == 2 else "")
+                             if upgrade else ""),
+                            ("Current version", device.current_version or ("unknown" if upgrade else "")),
+                            ("Target version", device.target_version or ("unknown" if upgrade else "")),
+                            ("Peer version", device.peer_version),
+                            ("HA suspended", ("Yes, restore it after the run" if device.ha_suspended else "No")
+                             if upgrade else ""),
+                            ("Serial", device.serial),
+                            ("IP address", device.ip),
+                            ("Started", f"{device.started:%H:%M:%S}" if device.started else ""),
+                            ("Last update", f"{device.updated:%H:%M:%S}" if device.updated else ""),
+                        ):
+                            if val:
+                                ui.label(key).classes("app-muted")
+                                ui.label(val).classes("app-mono")
+                    ui.label("Stages").classes("app-overline")
+                    with ui.row().classes("w-full gap-1"):
+                        for stage in tracker.stages[1:]:
+                            if stage == device.stage and device.status in ("failed", "interrupted", "not_upgraded"):
+                                ui.chip(stage, icon="error", color=color).props("dense text-color=white")
+                            elif stage == device.stage and device.status not in ("completed", "dry_run", "skipped"):
+                                ui.chip(stage, icon="sync", color="info").props("dense text-color=white")
+                            elif stage in device.reached:
+                                ui.chip(stage, icon="check", color="positive").props("dense outline")
+                            else:
+                                ui.chip(stage).props("dense outline").classes("opacity-50")
+                    if device.reports:
+                        ui.label("Reports" if tracker.kind == "upgrade" else "Backup files").classes("app-overline")
+                        for report in device.reports:
+                            ui.label(str(WORKSPACE / report)).classes("text-xs app-mono break-all")
+
+        lines = device.lines if device else []
+        if log_filter.value == "issues":
+            lines = [line for line in lines if line.startswith(ISSUE_EMOJI)]
+        log_key = (detail_key, log_filter.value, len(lines))
+        if log_key != state["log_key"]:
+            state["log_key"] = log_key
+            device_log.text = "\n".join(lines) if device else ""
+            if follow.value:
+                scroller.scroll_to(percent=1.0)
+
+    def select(hostname: Optional[str]):
+        filters["selected"] = hostname
+        state["key"] = None
+        refresh()
+
+    table.on_select(lambda e: select(e.selection[0]["hostname"] if e.selection else None))
+    table.on("rowClick", lambda e: select(e.args[1]["hostname"]))
+    source.on_value_change(lambda: select(None))
+    log_filter.on_value_change(lambda: refresh_detail(current_tracker()))
+
+    def watch_runs():
+        # A new run started (possibly from another browser tab): offer it and switch to it
+        if runner.command in TRACKED_COMMANDS and state.get("run_id") != runner.run_id:
+            state["run_id"] = runner.run_id
+            refresh_sources()
+            source.value = "current"
+        refresh()
+
+    ui.timer(1, watch_runs)
+    refresh_sources()
+
+
 def history_page():
     actions = page_header("Monitoring", "Run history", f"Console output of runs launched from this GUI ({CONSOLE_DIR}).",
                           "history")
@@ -1140,7 +1849,7 @@ def guide_page():
 # ---------------------------------------------------------------------------
 
 
-def output_dock():
+def output_dock(navigate: Callable[[str], None]):
     """Collapsible output panel docked at the bottom of every page, like an IDE's terminal."""
     state = {"run_id": None, "seen": 0, "expanded": False, "last_status": None, "prompted": False}
 
@@ -1157,6 +1866,9 @@ def output_dock():
                 description = ui.label().classes("text-sm truncate min-w-0")
                 elapsed = ui.label().classes("text-sm app-muted app-mono shrink-0")
                 ui.space()
+                devices = ui.button(icon="monitor_heart", on_click=lambda: navigate("tracker")).props(
+                    "flat dense no-caps"
+                ).classes("text-sm").tooltip("Open the Upgrade tracker")
                 copy_path = ui.button(icon="content_copy", on_click=lambda: copy_console_path()).props(
                     "flat dense round"
                 ).tooltip("Copy the path of this run's saved output")
@@ -1243,6 +1955,8 @@ def output_dock():
             status.props(f"color={color} icon={icon}")
         description.text = runner.description
         elapsed.text = runner.elapsed()
+        devices.set_text(runner.tracker.summary())
+        devices.set_visibility(bool(runner.tracker.devices))
         prompt.text = runner.partial.strip() if runner.awaiting_input else "Waiting for output..."
         reply_bar.set_visibility(runner.running)
         if runner.awaiting_input and not state["prompted"]:
@@ -1346,10 +2060,14 @@ def index(page: Optional[str] = None):
                 panorama_page(navigate)
             with ui.tab_panel("batch"):
                 batch_page(navigate)
+            with ui.tab_panel("backup"):
+                backup_page(navigate)
             with ui.tab_panel("inventory"):
                 inventory_page()
             with ui.tab_panel("settings"):
                 settings_page()
+            with ui.tab_panel("tracker"):
+                tracker_page()
             with ui.tab_panel("history"):
                 history_page()
             with ui.tab_panel("logs"):
@@ -1357,7 +2075,7 @@ def index(page: Optional[str] = None):
             with ui.tab_panel("guide"):
                 guide_page()
 
-    show_output = output_dock()
+    show_output = output_dock(navigate)
     header_status.on("click", show_output)
 
     def update_header_status():

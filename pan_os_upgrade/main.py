@@ -74,6 +74,7 @@ Notes
 # standard library imports
 import logging
 import sys
+import time
 import yaml
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -92,6 +93,12 @@ from dynaconf import Dynaconf
 
 # project imports
 from pan_os_upgrade.components.assurance import AssuranceOptions
+from pan_os_upgrade.components.backup import (
+    backup_device,
+    backup_device_direct,
+    load_management_addresses,
+    parse_addresses_option,
+)
 from pan_os_upgrade.components.device import (
     common_setup,
     connect_to_host,
@@ -931,6 +938,274 @@ def batch(
         typer.echo("Upgrade cancelled.")
 
 
+# Subcommand for backing up device configurations, independently of an upgrade
+@app.command()
+def backup(
+    username: Annotated[
+        str,
+        typer.Option(
+            "--username",
+            "-u",
+            help="Username for authentication with the firewall or Panorama. With --direct, the same username is used on every firewall.",
+            prompt="Username",
+        ),
+    ],
+    password: Annotated[
+        str,
+        typer.Option(
+            "--password",
+            "-p",
+            help="Password for authentication with the firewall or Panorama. With --direct, the same password is used on every firewall.",
+            prompt="Password",
+            hide_input=True,
+        ),
+    ],
+    hostname: Annotated[
+        Optional[str],
+        typer.Option(
+            "--hostname",
+            "-h",
+            help="Hostname or IP address of a firewall, or of Panorama to back up the firewalls it manages. Not used with --direct.",
+            callback=ip_callback,
+        ),
+    ] = None,
+    inventory: Annotated[
+        Optional[str],
+        typer.Option(
+            "--inventory",
+            "-i",
+            help="Comma delimited list of firewall hostnames to back up through Panorama. Takes precedence over inventory file.",
+        ),
+    ] = None,
+    device_state: Annotated[
+        bool,
+        typer.Option(
+            "--device-state",
+            help="Also export each firewall's device state bundle (configuration pushed by Panorama, certificates).",
+        ),
+    ] = False,
+    include_panorama: Annotated[
+        bool,
+        typer.Option(
+            "--include-panorama",
+            help="When connecting to Panorama, also back up Panorama's own running configuration.",
+        ),
+    ] = False,
+    non_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--non-interactive",
+            help="Never show the device selection table. Requires --inventory or inventory.yaml when connecting to Panorama.",
+        ),
+    ] = False,
+    direct: Annotated[
+        bool,
+        typer.Option(
+            "--direct",
+            help="Connect to each firewall's management interface instead of going through Panorama, using the management_addresses in inventory.yaml and the same credentials for every firewall.",
+        ),
+    ] = False,
+    addresses: Annotated[
+        Optional[str],
+        typer.Option(
+            "--addresses",
+            help="With --direct: management addresses as hostname=address pairs, comma delimited. Added to, and taking precedence over, management_addresses in inventory.yaml.",
+        ),
+    ] = None,
+):
+    """
+    Backs up the running configuration of firewalls, without upgrading anything.
+
+    Connecting to a firewall backs up that firewall. Connecting to Panorama backs up the managed
+    firewalls selected with --inventory, inventory.yaml or the selection table, through Panorama.
+    Each device's files are saved to assurance/backups/<hostname>/<timestamp>/: running-config.xml
+    and, with --device-state, device-state.tgz.
+
+    Through Panorama, device state can't be downloaded (Panorama doesn't relay files from managed
+    firewalls) and local administrator password hashes come back masked. --direct avoids both by
+    connecting to each firewall's management interface, listed in inventory.yaml:
+
+        management_addresses:
+          fw1: 203.0.113.10
+          fw2: 203.0.113.11
+
+    Every firewall must accept the same username and password. --inventory limits a direct backup
+    to some of the listed firewalls.
+
+    The configuration is taken with the XML API export, falling back to the configuration API. Values
+    PAN-OS masks (********), such as local administrator password hashes, are counted and reported:
+    they have to be re-entered after restoring that backup.
+
+    The command exits with code 1 if any requested file couldn't be saved, so it can gate an upgrade:
+        $ pan-os-upgrade backup -h panorama.example.com -u admin --non-interactive && pan-os-upgrade batch ...
+
+    Examples
+    --------
+    Backing up the firewalls listed in inventory.yaml through Panorama:
+        $ pan-os-upgrade backup --hostname panorama.example.com --username admin
+
+    Backing up two firewalls with their device state, directly:
+        $ pan-os-upgrade backup --direct --username admin --inventory fw1,fw2 --device-state
+    """
+
+    banner = console_welcome_banner(
+        config_path=SETTINGS_FILE_PATH,
+        inventory_path=INVENTORY_FILE_PATH,
+        mode="backup",
+    )
+    typer.echo(banner)
+
+    common_setup(
+        settings_file=SETTINGS_FILE,
+        settings_file_path=SETTINGS_FILE_PATH,
+    )
+
+    # (hostname, address, device) for each device to back up. device is None for direct backups,
+    # which connect inside their own thread so one unreachable firewall doesn't stop the others.
+    targets = []
+
+    if direct:
+        hostname = "direct"
+        management_addresses = load_management_addresses(INVENTORY_FILE_PATH)
+        if addresses:
+            try:
+                management_addresses.update(parse_addresses_option(addresses))
+            except ValueError as e:
+                logging.error(f"{get_emoji(action='error')} --addresses: {e}")
+                sys.exit(1)
+        selected = inventory.split(",") if inventory else list(management_addresses)
+        missing = [name for name in selected if name not in management_addresses]
+        if missing:
+            logging.error(
+                f"{get_emoji(action='error')} No management address for {missing}. Add them under management_addresses in inventory.yaml or with --addresses. Exiting."
+            )
+            sys.exit(1)
+        targets = [(name, management_addresses[name], None) for name in selected]
+
+    else:
+        if not hostname:
+            hostname = typer.prompt("Firewall or Panorama hostname or IP")
+        device = connect_to_host(
+            hostname=hostname,
+            username=username,
+            password=password,
+        )
+
+        if type(device) is Firewall:
+            targets.append((device.show_system_info()["system"]["hostname"], hostname, device))
+
+        else:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: Connection to Panorama established. Firewall connections will be proxied!"
+            )
+            logging.info(
+                f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
+            )
+            all_firewalls = get_firewalls_from_panorama(panorama=device)
+            logging.info(
+                f"{get_emoji(action='working')} {hostname}: Retrieving detailed information of each firewall..."
+            )
+            firewalls_info = threaded_get_firewall_details(firewalls=all_firewalls)
+            firewall_mapping = create_firewall_mapping(
+                all_firewalls=all_firewalls,
+                firewalls_info=firewalls_info,
+            )
+
+            # --inventory cli option takes precedence over inventory file
+            if inventory:
+                user_selected_hostnames = inventory.split(",")
+            elif INVENTORY_FILE_PATH.exists():
+                with open(INVENTORY_FILE_PATH, "r") as file:
+                    user_selected_hostnames = (yaml.safe_load(file) or {}).get("firewalls_to_upgrade", [])
+            elif non_interactive:
+                user_selected_hostnames = []
+            else:
+                user_selected_hostnames = select_devices_from_table(firewall_mapping=firewall_mapping)
+
+            absent_firewalls = set(user_selected_hostnames) - set(firewall_mapping)
+            if absent_firewalls:
+                logging.error(
+                    f"{get_emoji(action='error')} Firewalls {list(absent_firewalls)} in inventory are absent in Panorama. Exiting."
+                )
+                sys.exit(1)
+
+            targets = [
+                (name, firewall_mapping[name]["ip-address"], firewall_mapping[name]["object"])
+                for name in user_selected_hostnames
+            ]
+
+            if include_panorama:
+                targets.append((device.show_system_info()["system"]["hostname"], hostname, device))
+
+    if not targets:
+        typer.echo("No devices selected for backup.")
+        raise typer.Exit(code=1)
+
+    device_list = "\n".join(f"  - {name} ({address})" for name, address, _ in targets)
+    typer.echo(
+        f"{get_emoji(action='report')} {hostname}: Backing up {len(targets)} devices"
+        + (" directly, with the same credentials on each" if direct else "")
+        + f". Please confirm the selected firewalls:\n{device_list}"
+    )
+
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    threads = SETTINGS_FILE.get("concurrency.threads", 10)
+    logging.info(f"{get_emoji(action='working')} {hostname}: Using {threads} threads.")
+
+    connection_timeout = SETTINGS_FILE.get("timeout_settings.connection_timeout", 30)
+    command_timeout = SETTINGS_FILE.get("timeout_settings.command_timeout", 120)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        future_to_name = {
+            (
+                executor.submit(
+                    backup_device_direct,
+                    hostname=name,
+                    address=address,
+                    username=username,
+                    password=password,
+                    directory=f"assurance/backups/{name}/{timestamp}",
+                    device_state=device_state,
+                    connection_timeout=connection_timeout,
+                    command_timeout=command_timeout,
+                )
+                if direct
+                else executor.submit(
+                    backup_device,
+                    target_device=target,
+                    hostname=name,
+                    directory=f"assurance/backups/{name}/{timestamp}",
+                    device_state=device_state,
+                )
+            ): name
+            for name, address, target in targets
+        }
+        for future in as_completed(future_to_name):
+            results.append(future.result())
+
+    failed = [result for result in results if not result.success]
+    masked = [result for result in results if result.success and result.masked_values]
+    no_state = [result for result in results if result.device_state_error]
+    logging.info(
+        f"{get_emoji(action='report')} {hostname}: Backup summary: {len(results) - len(failed)} running configurations "
+        f"saved, {len(failed)} failed" + (f", device state missing for {len(no_state)}." if no_state else ".")
+    )
+    for result in masked:
+        logging.warning(
+            f"{get_emoji(action='warning')} {hostname}: {result.hostname} backup has {result.masked_values} masked values to re-enter after a restore."
+        )
+    for result in no_state:
+        logging.warning(
+            f"{get_emoji(action='warning')} {hostname}: {result.hostname} device state export failed: {result.device_state_error}"
+        )
+    for result in failed:
+        logging.error(f"{get_emoji(action='error')} {hostname}: {result.hostname} backup failed: {result.error}")
+    # Any missing file that was asked for fails the run, so a script gating an upgrade notices
+    if failed or no_state:
+        raise typer.Exit(code=1)
+
+
 # Subcommand for generating an inventory.yaml file
 @app.command()
 def inventory(
@@ -1055,13 +1330,16 @@ def inventory(
         firewall_mapping=firewall_mapping
     )
 
+    # Keep other sections, such as management_addresses for direct backups
+    inventory_data = {}
+    if INVENTORY_FILE_PATH.exists():
+        with open(INVENTORY_FILE_PATH, "r") as file:
+            inventory_data = yaml.safe_load(file) or {}
+    inventory_data["firewalls_to_upgrade"] = [hostname for hostname in user_selected_hostnames]
+
     with open("inventory.yaml", "w") as file:
         yaml.dump(
-            {
-                "firewalls_to_upgrade": [
-                    hostname for hostname in user_selected_hostnames
-                ]
-            },
+            inventory_data,
             file,
             default_flow_style=False,
         )

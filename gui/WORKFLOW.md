@@ -9,15 +9,15 @@ after the upgrade.
 ## The workflow at a glance
 
 ```
-1. Prepare        versions, compatibility, HA state, maintenance window, settings, inventory
+1. Prepare        versions, compatibility, HA state, maintenance window, settings, inventory, config backup
       │
 2. Dry run        download + snapshot + readiness checks + config backup, no install, no reboot
       │
-3. Review         Output panel, Run history, readiness results
+3. Review         Upgrade tracker, Output panel, Run history, readiness results
       │
 4. Live upgrade   install + reboot (HA: passive member first, then active)
       │
-5. Monitor        Output panel, answer prompts if asked
+5. Monitor        Upgrade tracker, Output panel, answer prompts if asked
       │
 6. Verify         HA state (restore suspended members), versions, sync, active member, diff reports
 ```
@@ -35,7 +35,8 @@ Every run started from the GUI works in `gui/workspace/`:
 | Readiness check results | `gui/workspace/assurance/readiness_checks/<host>/pre/` |
 | Snapshots before and after | `gui/workspace/assurance/snapshots/<host>/pre/` and `post/` |
 | Snapshot comparison (JSON and PDF) | `gui/workspace/assurance/snapshots/<host>/diff/` |
-| Configuration backups | `gui/workspace/assurance/configurations/<host>/pre/` and `post/` |
+| Configuration copies taken during upgrades | `gui/workspace/assurance/configurations/<host>/pre/` and `post/` (secrets masked, not for restore) |
+| Restorable configuration backups | `gui/workspace/assurance/backups/<host>/<date>_<time>/` (made by **Config backup**) |
 
 ## Step 1: Prepare
 
@@ -77,6 +78,40 @@ Open **Configuration → Inventory** and either:
   reloads when the file changes.
 
 **List both members of every HA pair.** Hostnames must match the names in Panorama.
+
+### Back up the configurations
+
+Open **Operations → Config backup**, enter Panorama (or a single firewall) and its credentials, and
+click **Start backup**. It uses the same device list as the batch upgrade: the field on the page,
+otherwise the saved inventory, otherwise a selection table in the Output panel. Nothing on the
+devices changes. Progress shows on the **Upgrade tracker**.
+
+- Each device gets `running-config.xml` in `assurance/backups/<host>/<date>_<time>/`, which can be
+  imported and loaded back onto the firewall (*Device → Setup → Operations → Import named
+  configuration snapshot*).
+- **Masked values:** PAN-OS replaces local administrator password hashes with `********`. Through
+  Panorama, the export returns this masked content too (tested on PAN-OS 11.2), so after restoring
+  such a backup, re-enter those administrators' passwords. The run reports how many values each
+  backup has masked.
+- **Also export device state** adds `device-state.tgz`: the configuration Panorama pushes plus the
+  certificates. It only works when the target is the firewall itself. Through Panorama, the firewall
+  creates the bundle but Panorama doesn't send it back, so the run reports that, keeps the running
+  configuration, and exits with code 1. To replace a Panorama-managed firewall you don't need this
+  file: Panorama can generate the bundle (*Panorama → Managed Devices → Summary → Export or push
+  device config bundle*).
+- **Direct to firewalls** connects to each firewall's management interface instead of Panorama, so
+  device state can be downloaded and nothing is relayed through Panorama. List the addresses under
+  **Configuration → Inventory → Management addresses**, one `hostname address` per line, using an
+  address this computer can reach (in AWS, typically a public or Elastic IP on the management
+  interface). Every firewall must accept the **same username and password**. Before saving
+  anything, the CLI checks that each address answers with the expected hostname, so a wrong address
+  can't save one firewall's configuration under another's name. A firewall that can't be reached
+  fails on its own after the connection timeout (Settings → Connection timeout, 30 s by default).
+- **Latest backups** on the page shows each device's newest backup and its age. When you start a
+  live batch upgrade, the confirmation lists target firewalls with no backup from the last 24 hours.
+
+The upgrade itself also saves a copy to `assurance/configurations/`, but it runs late (after the
+download and readiness checks), so devices that stop early get none.
 
 ## Step 2: Dry run
 
@@ -152,6 +187,10 @@ to the upgraded member, and the original active member is upgraded.
 
 ## Step 5: Monitor
 
+- **Upgrade tracker** (Monitoring menu, opened automatically when a run starts): one row per device
+  with its HA role, round, stage, latest activity and issues. Filter by status, role or text, and
+  select a device to see only its log. The Output panel header shows a one-line device summary;
+  click it to open the tracker. See the [HA upgrade guide](README.md#what-you-see-in-the-gui).
 - **Status badge** (header and Output panel): *Running*, *Awaiting input*, *Completed*,
   *Failed (exit N)* or *Stopped*, with elapsed time.
 - **Awaiting input:** the Output panel opens with the CLI's question in the orange bar. Type a reply

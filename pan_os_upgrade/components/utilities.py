@@ -246,9 +246,10 @@ def console_welcome_banner(
             "firewall": "The selected `firewall` subcommand will upgrade a single Firewall appliance.",
             "panorama": "The selected `panorama` subcommand will upgrade a single Panorama appliance.",
             "batch": "The selected `batch` subcommand will upgrade one or more firewalls.",
+            "backup": "The selected `backup` subcommand will back up the configuration of one or more devices.",
         }.get(mode, "")
 
-        if mode == "batch":
+        if mode in ("batch", "backup"):
             inventory_message = (
                 f"Inventory: Custom inventory loaded file detected and loaded at:\n{inventory_path}"
                 if inventory_path and inventory_path.exists()
