@@ -981,7 +981,7 @@ def backup(
         bool,
         typer.Option(
             "--device-state",
-            help="Also export each firewall's device state bundle (configuration pushed by Panorama, certificates).",
+            help="Also export each firewall's device state bundle (configuration pushed by Panorama, certificates). Only with --direct, or when --hostname is a firewall: Panorama doesn't relay device state.",
         ),
     ] = False,
     include_panorama: Annotated[
@@ -1021,9 +1021,10 @@ def backup(
     Each device's files are saved to assurance/backups/<hostname>/<timestamp>/: running-config.xml
     and, with --device-state, device-state.tgz.
 
-    Through Panorama, device state can't be downloaded (Panorama doesn't relay files from managed
-    firewalls) and local administrator password hashes come back masked. --direct avoids both by
-    connecting to each firewall's management interface, listed in inventory.yaml:
+    Device state is only exported from firewalls connected directly: with --direct, or when
+    --hostname is a firewall. Through Panorama it isn't available (Panorama doesn't relay the file),
+    and local administrator password hashes come back masked. --direct connects to each firewall's
+    management interface, listed in inventory.yaml:
 
         management_addresses:
           fw1: 203.0.113.10
@@ -1090,6 +1091,12 @@ def backup(
             username=username,
             password=password,
         )
+
+        if device_state and type(device) is Panorama:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: --device-state isn't available through Panorama, which doesn't relay the file. Use --direct to back up the firewalls' device state. Exiting."
+            )
+            sys.exit(1)
 
         if type(device) is Firewall:
             targets.append((device.show_system_info()["system"]["hostname"], hostname, device))

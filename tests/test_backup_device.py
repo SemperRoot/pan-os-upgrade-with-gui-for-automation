@@ -111,10 +111,16 @@ def test_device_state(tmp_path, state, saved, reason):
 
 def test_panorama_backup_expects_panorama_config(tmp_path):
     xapi = FakeXapi(export_xml=PANORAMA_CONFIG)
-    result = backup_device(device(Panorama, xapi), "panorama1", str(tmp_path), device_state=True)
-
-    # Device state is a firewall export; it's skipped for Panorama
+    result = backup_device(device(Panorama, xapi), "panorama1", str(tmp_path))
     assert result.success and [c for c, _ in xapi.export_calls] == ["configuration"]
+
+
+@pytest.mark.parametrize("cls, serial", [(Firewall, "007900000001"), (Panorama, None)])
+def test_device_state_only_for_firewalls_connected_directly(tmp_path, cls, serial):
+    xapi = FakeXapi(export_xml=FIREWALL_CONFIG, serial=serial)
+    with pytest.raises(ValueError, match="connected directly"):
+        backup_device(device(cls, xapi), "fw1", str(tmp_path), device_state=True)
+    assert xapi.export_calls == []
 
 
 def test_check_config_xml_warnings():
@@ -130,25 +136,6 @@ def test_describe_export_response():
     error = '<response status="error"><msg><line>Command not supported via Panorama</line></msg></response>'
     assert _describe_export_response(None, error) == '<response status="error"> Command not supported via Panorama'
     assert _describe_export_response(None, FIREWALL_CONFIG) == "a configuration file instead of a .tgz bundle"
-
-
-def test_device_state_through_panorama_explains_the_limit(tmp_path):
-    xapi = FakeXapi(export_xml=FIREWALL_CONFIG, serial="007900000001")
-    xapi._state = None
-    original = xapi.export
-
-    def export(category=None, extra_qs=None):
-        original(category, extra_qs)
-        if category == "device-state":
-            xapi.xml_document = (
-                '<response status="success"><result>Device state device_state_cfg.tgz created successfully'
-                "</result></response>"
-            )
-
-    xapi.export = export
-    result = backup_device(device(Firewall, xapi), "fw1", str(tmp_path), device_state=True)
-    assert result.success
-    assert "Panorama doesn't relay file downloads" in result.device_state_error
 
 
 # Direct backups

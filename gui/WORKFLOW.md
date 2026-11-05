@@ -81,33 +81,31 @@ Open **Configuration → Inventory** and either:
 
 ### Back up the configurations
 
-Open **Operations → Config backup**, enter Panorama (or a single firewall) and its credentials, and
-click **Start backup**. It uses the same device list as the batch upgrade: the field on the page,
-otherwise the saved inventory, otherwise a selection table in the Output panel. Nothing on the
-devices changes. Progress shows on the **Upgrade tracker**.
+Config backup connects **directly to each firewall's management interface**, not through Panorama:
+through Panorama, device state can't be downloaded (the firewall creates the bundle, but Panorama
+doesn't send it back).
 
-- Each device gets `running-config.xml` in `assurance/backups/<host>/<date>_<time>/`, which can be
+1. Open **Configuration → Inventory → Management addresses** and list each firewall, one
+   `hostname address` per line. Use an address this computer can reach (in AWS, typically a public
+   or Elastic IP on the management interface) and the hostname the firewall reports.
+2. Open **Operations → Config backup**, enter the username and password, optionally limit the run
+   to some firewalls, and click **Start backup**. Nothing on the devices changes. Progress shows on
+   the **Upgrade tracker**.
+
+- **Every firewall must accept the same username and password.** A firewall that rejects them
+  fails on its own; the others carry on.
+- Each firewall gets `running-config.xml` in `assurance/backups/<host>/<date>_<time>/`, which can be
   imported and loaded back onto the firewall (*Device → Setup → Operations → Import named
   configuration snapshot*).
-- **Masked values:** PAN-OS replaces local administrator password hashes with `********`. Through
-  Panorama, the export returns this masked content too (tested on PAN-OS 11.2), so after restoring
-  such a backup, re-enter those administrators' passwords. The run reports how many values each
-  backup has masked.
 - **Also export device state** adds `device-state.tgz`: the configuration Panorama pushes plus the
-  certificates. It only works when the target is the firewall itself. Through Panorama, the firewall
-  creates the bundle but Panorama doesn't send it back, so the run reports that, keeps the running
-  configuration, and exits with code 1. To replace a Panorama-managed firewall you don't need this
-  file: Panorama can generate the bundle (*Panorama → Managed Devices → Summary → Export or push
-  device config bundle*).
-- **Direct to firewalls** connects to each firewall's management interface instead of Panorama, so
-  device state can be downloaded and nothing is relayed through Panorama. List the addresses under
-  **Configuration → Inventory → Management addresses**, one `hostname address` per line, using an
-  address this computer can reach (in AWS, typically a public or Elastic IP on the management
-  interface). Every firewall must accept the **same username and password**. Before saving
-  anything, the CLI checks that each address answers with the expected hostname, so a wrong address
-  can't save one firewall's configuration under another's name. A firewall that can't be reached
-  fails on its own after the connection timeout (Settings → Connection timeout, 30 s by default).
-- **Latest backups** on the page shows each device's newest backup and its age. When you start a
+  certificates. It's what you load to restore or replace a firewall.
+- Before saving anything, the CLI checks that each address answers with the expected hostname, so
+  a wrong address can't save one firewall's configuration under another's name. A firewall that
+  can't be reached fails after the connection timeout (Settings → Connection timeout, 30 s by
+  default).
+- **Masked values:** if PAN-OS returns `********` in place of a value, such as a local administrator
+  password hash, the run reports how many. Re-enter those values after restoring that backup.
+- **Latest backups** on the page shows each firewall's newest backup and its age. When you start a
   live batch upgrade, the confirmation lists target firewalls with no backup from the last 24 hours.
 
 The upgrade itself also saves a copy to `assurance/configurations/`, but it runs late (after the

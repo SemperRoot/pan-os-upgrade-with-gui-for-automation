@@ -6,21 +6,17 @@ in the upgrade and only for devices that get that far. This module takes the bac
 the XML API export (the same export as Device > Setup > Operations > Export named configuration
 snapshot), falling back to the configuration API.
 
-Going through Panorama has two limits, seen on PAN-OS 11.2 and consistent with every other tool
-that exports device state (they all connect to the firewall directly):
+Going through Panorama has two limits, seen on PAN-OS 11.2:
 - The running configuration export comes back identical to `show config running`, with local
   administrator password hashes masked as ********. Each backup reports how many values are masked.
-- A device state export is relayed to the firewall, which creates device_state_cfg.tgz and answers
-  "created successfully", but Panorama never returns the file. Downloading it needs a direct
-  connection to the firewall's management interface.
+- Device state can't be downloaded: the firewall creates device_state_cfg.tgz, but Panorama doesn't
+  relay the file. Device state is therefore only exported from firewalls connected directly.
 
 Direct backups (`backup --direct`) connect to each firewall's management interface instead, using
 the addresses in the `management_addresses` section of inventory.yaml and one set of credentials
 for every firewall.
 """
 
-# The firewall's answer when a device state export reaches it through Panorama
-CREATED_ON_FIREWALL = "created successfully"
 
 # standard library imports
 import logging
@@ -185,8 +181,8 @@ def backup_device(
     directory : str
         Folder for this device's backup files, for example assurance/backups/<hostname>/<timestamp>.
     device_state : bool
-        Also export the device state bundle (firewalls only). It includes the configuration pushed
-        by Panorama and the certificates, and is what you need to restore or replace a managed firewall.
+        Also export the device state bundle: the configuration pushed by Panorama plus the
+        certificates. Only for firewalls connected directly, not through Panorama.
 
     Returns
     -------
@@ -195,6 +191,8 @@ def backup_device(
     """
     result = BackupResult(hostname=hostname)
     is_panorama = type(target_device) is Panorama
+    if device_state and (is_panorama or getattr(target_device.xapi, "serial", None)):
+        raise ValueError("device state is only exported from firewalls connected directly, not through Panorama")
 
     try:
         logging.info(f"{get_emoji(action='start')} {hostname}: Exporting running configuration.")
@@ -219,16 +217,11 @@ def backup_device(
         return result
 
     result.success = True
-    if device_state and not is_panorama:
+    if device_state:
         # A failure here doesn't undo the running configuration backup already saved
         try:
             logging.info(f"{get_emoji(action='start')} {hostname}: Exporting device state.")
             content, xml_document = _export(target_device, "device-state")
-            if not content and CREATED_ON_FIREWALL in xml_document and getattr(target_device.xapi, "serial", None):
-                raise RuntimeError(
-                    "the firewall created the bundle, but Panorama doesn't relay file downloads from managed "
-                    "firewalls. Device state can only be downloaded by connecting to the firewall directly."
-                )
             if not content or content[:2] != b"\x1f\x8b":
                 raise RuntimeError(f"it returned {_describe_export_response(content, xml_document)}")
             state_path = os.path.join(directory, "device-state.tgz")

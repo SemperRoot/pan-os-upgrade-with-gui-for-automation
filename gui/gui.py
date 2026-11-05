@@ -444,6 +444,9 @@ def latest_backups() -> dict[str, dict]:
     """Newest successful backup of each device, from assurance/backups/<hostname>/<timestamp>/."""
     found = {}
     for host_dir in BACKUPS_DIR.iterdir() if BACKUPS_DIR.exists() else []:
+        # Skip files such as the .DS_Store macOS Finder leaves behind; each device is a folder
+        if not host_dir.is_dir() or host_dir.name.startswith("."):
+            continue
         runs = sorted(
             (d for d in host_dir.iterdir() if d.is_dir() and (d / "running-config.xml").exists()), reverse=True
         )
@@ -452,7 +455,7 @@ def latest_backups() -> dict[str, dict]:
                 taken = datetime.strptime(run_dir.name, "%Y-%m-%d_%H-%M-%S")
             except ValueError:
                 continue
-            found[host_dir.name] = {"taken": taken, "path": run_dir, "files": sorted(f.name for f in run_dir.iterdir())}
+            found[host_dir.name] = {"taken": taken, "path": run_dir, "files": sorted(f.name for f in run_dir.iterdir() if not f.name.startswith("."))}
             break
     return found
 
@@ -914,37 +917,22 @@ def batch_page(navigate: Callable[[str], None]):
 
 def backup_page(navigate: Callable[[str], None]):
     page_header("Operations", "Config backup",
-                "Save running configurations before an upgrade. Nothing on the devices changes.", "save")
+                "Save firewall configurations before an upgrade. Nothing on the devices changes.", "save")
     form, side = operation_columns()
     with form:
-        with card("Connection", "How to reach the firewalls", icon="hub"):
-            mode = remembered(
-                ui.toggle({"panorama": "Through Panorama", "direct": "Direct to firewalls"}, value="panorama").props(
-                    "spread no-caps unelevated toggle-color=primary"
-                ).classes("w-full").mark("backup-mode"),
-                "backup.mode",
-            )
-            panorama_note = notice(
-                "Connects to Panorama, or to a single firewall. Through Panorama, local administrator password "
-                "hashes come back masked and device state can't be downloaded.",
-                "info",
-                "dns",
-            )
-            direct_note = notice(
-                "Connects to each firewall's management interface, using the addresses on the Inventory page. "
-                "Every firewall must accept the same username and password.",
+        with card("Connection", "How the firewalls are reached", icon="hub"):
+            notice(
+                "Connects directly to each firewall's management interface, using the addresses on the Inventory "
+                "page. Every firewall must accept the same username and password.",
                 "warning",
                 "settings_ethernet",
-            )
-            hostname = remembered(
-                text_field("Firewall or Panorama hostname or IP", required=True, mark="backup-hostname"),
-                "backup.hostname",
             )
         with card("Devices", "Which firewalls to back up", icon="lan"):
             inventory = remembered(
                 text_field(
                     "Firewall hostnames, comma separated",
-                    hint="Optional. Names must match the hostnames in Panorama or on the Inventory page.",
+                    hint="Optional. Names must match the Management addresses on the Inventory page. "
+                         "Leave empty to back up every firewall listed there.",
                     mark="backup-inventory",
                 ),
                 "backup.inventory",
@@ -958,18 +946,11 @@ def backup_page(navigate: Callable[[str], None]):
         with card("Options", "What to export from each device", icon="tune"):
             device_state = remembered(ui.switch("Also export device state"), "backup.device_state")
             ui.label(
-                "Device state includes the configuration Panorama pushes and the certificates. It needs a direct "
-                "connection to the firewall: through Panorama, the firewall creates the bundle but Panorama "
-                "doesn't send it back. To replace a managed firewall, Panorama can also generate the bundle itself "
-                "(Managed Devices → Summary → Export or push device config bundle)."
+                "Device state includes the configuration Panorama pushes and the certificates. It's what you load "
+                "to restore or replace a firewall."
             ).classes("text-xs app-muted -mt-3")
-            include_panorama = remembered(
-                ui.switch("Also back up Panorama's own configuration"), "backup.include_panorama"
-            )
         with card("Credentials", "Passwords are never saved", icon="key"):
-            shared_credentials = ui.label(
-                "Direct mode signs in to every firewall with this username and password."
-            ).classes("text-sm app-muted")
+            ui.label("Used to sign in to every firewall.").classes("text-sm app-muted")
             with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-4 w-full"):
                 username, password = credential_inputs("backup")
         with card("Latest backups", str(BACKUPS_DIR), icon="inventory"):
@@ -994,41 +975,20 @@ def backup_page(navigate: Callable[[str], None]):
     def field_targets() -> list[str]:
         return [h.strip() for h in (inventory.value or "").split(",") if h.strip()]
 
-    def direct() -> bool:
-        return mode.value == "direct"
-
-    def direct_targets() -> tuple[list[str], list[str]]:
-        """(firewalls to back up, those of them without a management address) in direct mode."""
+    def targets() -> tuple[list[str], list[str]]:
+        """(firewalls to back up, those of them without a management address)."""
         addresses = read_management_addresses()
-        targets = field_targets() or list(addresses)
-        return targets, [t for t in targets if t not in addresses]
-
-    def update_mode():
-        panorama_note.set_visibility(not direct())
-        direct_note.set_visibility(direct())
-        hostname.set_visibility(not direct())
-        include_panorama.set_visibility(not direct())
-        shared_credentials.set_visibility(direct())
-        update_device_source()
+        selected = field_targets() or list(addresses)
+        return selected, [t for t in selected if t not in addresses]
 
     def update_device_source():
-        if direct():
-            targets, missing = direct_targets()
-            source.text_label.text = (
-                "No management addresses yet. Add them on the Inventory page." if not targets
-                else f"No management address for {', '.join(missing)}. Add it on the Inventory page." if missing
-                else f"{len(targets)} firewalls, connected directly"
-                + (" (from the field above)." if field_targets() else " (all firewalls with a management address).")
-            )
-        elif field_targets():
-            source.text_label.text = f"{len(field_targets())} firewalls from the field above."
-        elif read_inventory():
-            source.text_label.text = f"{len(read_inventory())} firewalls from the saved inventory."
-        else:
-            source.text_label.text = (
-                "No devices set. With Panorama, you will pick them from a table in the Output panel. "
-                "With a firewall, that firewall is backed up."
-            )
+        selected, missing = targets()
+        source.text_label.text = (
+            "No management addresses yet. Add them on the Inventory page." if not selected
+            else f"No management address for {', '.join(missing)}. Add it on the Inventory page." if missing
+            else f"{len(selected)} firewalls"
+            + (" from the field above." if field_targets() else ", every firewall with a management address.")
+        )
 
     def refresh_backups():
         now = datetime.now()
@@ -1049,50 +1009,34 @@ def backup_page(navigate: Callable[[str], None]):
         no_backups.set_visibility(not rows)
 
     inventory.on_value_change(update_device_source)
-    mode.on_value_change(update_mode)
     ui.timer(3, update_device_source)
     ui.timer(10, refresh_backups)
-    update_mode()
+    update_device_source()
     refresh_backups()
 
     def command() -> list[str]:
-        if direct():
-            args = ["backup", "--direct", "--username", arg(username, "username")]
-        else:
-            args = ["backup", "--hostname", arg(hostname, "hostname"), "--username", arg(username, "username")]
+        args = ["backup", "--direct", "--username", arg(username, "username")]
         if field_targets():
             args += ["--inventory", ",".join(field_targets())]
         if device_state.value:
             args.append("--device-state")
-        if include_panorama.value and not direct():
-            args.append("--include-panorama")
         return args
 
     async def start():
-        if direct():
-            if not validate_required(username, password):
-                return
-            targets, missing = direct_targets()
-            if not targets or missing:
-                ui.notify(source.text_label.text, type="negative")
-                return
-            description = f"direct backup of {len(targets)} firewalls"
-        else:
-            if not validate_required(hostname, username, password):
-                return
-            if not (field_targets() or read_inventory()):
-                ui.notify("If the target is Panorama, pick devices in the Output panel: enter numbers (e.g. 1,3-4), "
-                          "then click Done.", type="info")
-            description = f"backup via {value(hostname)}"
-        if await launch(command(), [password.value], description):
+        if not validate_required(username, password):
+            return
+        selected, missing = targets()
+        if not selected or missing:
+            ui.notify(source.text_label.text, type="negative")
+            return
+        if await launch(command(), [password.value], f"backup of {len(selected)} firewalls"):
             navigate("tracker")
 
     with side:
         with card("Execution", "Review the command before running it", icon="play_circle"):
             notice(
-                "Read-only. Exports each device's running configuration and saves it to "
-                "assurance/backups/<hostname>/<time>/ in the workspace. Local administrator password hashes may "
-                "be masked; the run reports it.",
+                "Read-only. Exports each firewall's running configuration, and device state if selected, to "
+                "assurance/backups/<hostname>/<time>/ in the workspace.",
                 "info",
                 "save",
             )
