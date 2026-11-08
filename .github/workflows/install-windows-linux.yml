@@ -17,10 +17,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, ubuntu-latest]
-        python: ["3.11", "3.12.1", "3.13"]
+        python: ["3.11", "3.12", "3.13"]
+        include:
+          # The testers' exact version. GitHub has no 3.12.1 build for current Ubuntu runners.
+          - os: windows-2022
+            python: "3.12.1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -46,8 +50,8 @@ jobs:
     name: windows-2022 / offline wheelhouse install
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12.1"
       - name: Download packages (the internet-connected step)
