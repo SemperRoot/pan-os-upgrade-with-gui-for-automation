@@ -4,6 +4,11 @@ The CLI and the GUI run natively on **Windows** (10, 11, Server 2019, Server 202
 WSL isn't needed. They also work on air-gapped networks: packages can come from an internal PyPI
 mirror (Nexus, Artifactory) or from a folder of files you copy in.
 
+> **Tested on:** Windows Server 2022 with Python 3.11, 3.12.1, 3.12 and 3.13 (online, and offline from
+> a wheelhouse with no network), Ubuntu with Python 3.11 to 3.13, and macOS. Every change is tested
+> automatically on Windows Server 2022 and Ubuntu by the `Install and smoke test` GitHub workflow.
+> Other Windows versions should work the same way but haven't been tested.
+
 After installing, read [WORKFLOW.md](WORKFLOW.md) for how to run upgrades and [README.md](README.md)
 for how HA pairs are upgraded.
 

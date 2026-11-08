@@ -56,7 +56,11 @@ Encountering issues while using the `pan-os-upgrade` tool is not uncommon, espec
 
 **Problem:** The script fails performing snapshots with the error of: `Error: unsupported locale setting`.
 
-**Solution:**
+> **In this fork** the readiness checks fall back to another English locale (`C.UTF-8`, the Windows
+> `en-US` names, or `C`) when `en_US.UTF-8` isn't available, so this error no longer occurs and the
+> steps below aren't needed. WSL isn't needed on Windows either: see `gui/INSTALL.md`.
+
+**Solution (original project):**
 
 1: Open your WSL2 terminal.
 2: Run the command `sudo dpkg-reconfigure locales`.
