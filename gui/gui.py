@@ -7,12 +7,15 @@ inventory.yaml, logs/ and assurance/ outputs never collide with a CLI run starte
 the repository root.
 
 Run with:
-    gui/.venv/bin/python gui/gui.py
+    gui/.venv/bin/python gui/gui.py                 (Linux)
+    gui\\.venv\\Scripts\\python.exe gui\\gui.py         (Windows)
+or use gui/start-gui.sh / gui\\start-gui.cmd.
 
 Environment overrides:
-    PAN_OS_UPGRADE_BIN   path to the pan-os-upgrade executable
-    PAN_OS_GUI_WORKSPACE working directory for CLI runs launched from the GUI
-    PAN_OS_GUI_PORT      port to listen on (localhost only), default 8080
+    PAN_OS_UPGRADE_PYTHON  Python of the environment the CLI is installed in, default .venv-cli
+    PAN_OS_GUI_WORKSPACE   working directory for CLI runs launched from the GUI
+    PAN_OS_GUI_PORT        port to listen on (localhost only), default 8080
+    PAN_OS_GUI_NO_BROWSER  set to any value to not open a browser on start
 """
 
 # standard library imports
@@ -24,6 +27,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,12 +46,17 @@ from nicegui import app, background_tasks, run, ui  # noqa: E402
 # local imports
 from tracker import STATUS_GROUPS, STATUSES, TERMINAL, DeviceTracker  # noqa: E402
 
+IS_WINDOWS = sys.platform == "win32"
 REPO_DIR = GUI_DIR.parent
-CLI_BIN = Path(
+# The CLI runs from its own virtual environment (created by gui/install.py), through
+# cli_launcher.py so password prompts can be answered over stdin on every platform.
+CLI_PYTHON = Path(
     os.environ.get(
-        "PAN_OS_UPGRADE_BIN", REPO_DIR / "pan_os_upgrade" / "bin" / "pan-os-upgrade"
+        "PAN_OS_UPGRADE_PYTHON",
+        REPO_DIR / ".venv-cli" / ("Scripts/python.exe" if IS_WINDOWS else "bin/python"),
     )
 )
+CLI_LAUNCHER = GUI_DIR / "cli_launcher.py"
 WORKSPACE = Path(os.environ.get("PAN_OS_GUI_WORKSPACE", GUI_DIR / "workspace"))
 SETTINGS_PATH = WORKSPACE / "settings.yaml"
 INVENTORY_PATH = WORKSPACE / "inventory.yaml"
@@ -181,7 +190,7 @@ def load_assurance_options() -> tuple[dict, dict]:
     importing pan_os_upgrade (its dependencies live in a different virtual environment).
     """
     try:
-        tree = ast.parse(ASSURANCE_SOURCE.read_text())
+        tree = ast.parse(ASSURANCE_SOURCE.read_text(encoding="utf-8"))
     except (OSError, SyntaxError):
         return {}, {}
 
@@ -250,21 +259,29 @@ class Runner:
         self.command = args[0]
         self.tracker = DeviceTracker(kind="backup" if args[0] == "backup" else "upgrade")
 
-        env = dict(os.environ, PYTHONUNBUFFERED="1", NO_COLOR="1", TERM="dumb", COLUMNS="200")
+        # PYTHONUTF8: on Windows, output redirected to a file would otherwise use the ANSI code
+        # page and the CLI's emoji log lines would fail to encode.
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", NO_COLOR="1", TERM="dumb", COLUMNS="200")
 
         # Output goes to a file rather than a pipe, so the CLI keeps running safely if the GUI
-        # is closed mid-upgrade. A new session detaches it from any terminal, so password prompts
-        # read from stdin and the whole process group can be signalled on stop.
+        # is closed mid-upgrade. It is also detached from the GUI's terminal: a new session on
+        # Linux (so the whole process group can be signalled on stop), and its own hidden console
+        # on Windows (so closing the GUI's window or pressing Ctrl+C there doesn't kill it).
+        if IS_WINDOWS:
+            detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        else:
+            detach = {"start_new_session": True}
         with open(console_path, "wb") as console_file:
             self.process = await asyncio.create_subprocess_exec(
-                str(CLI_BIN),
+                str(CLI_PYTHON),
+                str(CLI_LAUNCHER),
                 *args,
                 cwd=WORKSPACE,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=console_file,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
-                start_new_session=True,
+                **detach,
             )
         for line in stdin_lines:
             self.process.stdin.write(f"{line}\n".encode())
@@ -324,6 +341,18 @@ class Runner:
             return
         self.stopping = True
         process = self.process
+        if IS_WINDOWS:
+            # Windows has no SIGINT/SIGTERM for a detached process: end it and anything it started.
+            self.lines.append("[GUI] Ending the process...")
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(process.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            await killer.wait()
+            if process.returncode is None:
+                process.kill()
+            return
         for sig, grace_seconds in ((signal.SIGINT, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
             if process.returncode is not None:
                 break
@@ -365,14 +394,35 @@ runner = Runner()
 
 def other_cli_processes() -> list[str]:
     """List pan-os-upgrade processes not started by this GUI (read-only check)."""
-    result = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+    if IS_WINDOWS:
+        list_command = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%' OR Name LIKE 'pan-os-upgrade%'\" | "
+            "Where-Object { $_.CommandLine } | "
+            "ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CommandLine }",
+        ]
+        extra = {"creationflags": subprocess.CREATE_NO_WINDOW}
+    else:
+        list_command, extra = ["ps", "-axo", "pid=,ppid=,command="], {}
+    try:
+        result = subprocess.run(list_command, capture_output=True, text=True, errors="replace", timeout=30, **extra)
+    except (OSError, subprocess.SubprocessError):
+        return []  # advisory check only: never block a run because processes can't be listed
     own_pid = runner.process.pid if runner.running else None
-    found = []
+    cli_names = {"pan-os-upgrade", "pan-os-upgrade.exe", CLI_LAUNCHER.name}
+    cli = {}  # pid -> (parent pid, command tokens)
     for line in result.stdout.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        tokens = command.split()
-        is_cli = any(Path(t).name == "pan-os-upgrade" or t == "pan_os_upgrade.main" for t in tokens)
-        if not pid.isdigit() or not is_cli or int(pid) == own_pid:
+        pid, ppid, *tokens = line.split()
+        if not (pid.isdigit() and ppid.isdigit()):
+            continue
+        if any(re.split(r"[\\/]", t.strip('"'))[-1] in cli_names or t == "pan_os_upgrade.main" for t in tokens):
+            cli[int(pid)] = (int(ppid), tokens)
+    found = []
+    for pid, (ppid, tokens) in cli.items():
+        # On Windows, a venv's python.exe and pan-os-upgrade.exe are launchers that start the real
+        # Python as a child, so one run is several processes: show only the top one, and skip
+        # children of this GUI's own run.
+        if own_pid in (pid, ppid) or ppid in cli:
             continue
         # Never display passwords passed on another process's command line
         for i, token in enumerate(tokens[:-1]):
@@ -385,14 +435,14 @@ def other_cli_processes() -> list[str]:
 
 def read_settings() -> dict:
     if SETTINGS_PATH.exists():
-        with open(SETTINGS_PATH) as f:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
 
 
 def read_inventory_file() -> dict:
     if INVENTORY_PATH.exists():
-        with open(INVENTORY_PATH) as f:
+        with open(INVENTORY_PATH, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
 
@@ -411,14 +461,14 @@ def write_inventory_section(key: str, data):
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     inventory = read_inventory_file()
     inventory[key] = data
-    with open(INVENTORY_PATH, "w") as f:
+    with open(INVENTORY_PATH, "w", encoding="utf-8") as f:
         yaml.dump(inventory, f, default_flow_style=False, sort_keys=False)
 
 
 def tail(path: Path, lines: int = 500) -> str:
     if not path.exists():
         return f"{path} does not exist yet."
-    with open(path, errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         return "".join(f.readlines()[-lines:])
 
 
@@ -682,8 +732,8 @@ async def launch(args: list[str], stdin_lines: list[str], description: str) -> b
     if runner.running:
         ui.notify("A command is already running. Stop it or wait for it to finish.", type="warning")
         return False
-    if not CLI_BIN.exists():
-        ui.notify(f"CLI not found: {CLI_BIN}", type="negative")
+    if not CLI_PYTHON.exists():
+        ui.notify(f"CLI not found: {CLI_PYTHON}. Run the installer (see gui/INSTALL.md).", type="negative")
         return False
     await runner.start(args, stdin_lines, description)
     ui.notify(f"Started: {description}", type="info")
@@ -711,7 +761,7 @@ def ha_guidance(first: str, second: str, navigate: Callable[[str], None], extra:
 
 def guide_markdown() -> str:
     try:
-        text = GUIDE_PATH.read_text()
+        text = GUIDE_PATH.read_text(encoding="utf-8")
     except OSError:
         return f"`{GUIDE_PATH}` not found."
     text = re.sub(r"\A# .*\n", "", text)  # the page header already shows the title
@@ -1301,7 +1351,7 @@ def settings_page():
         }
 
         WORKSPACE.mkdir(parents=True, exist_ok=True)
-        with open(SETTINGS_PATH, "w") as f:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=True)
         state["loaded"] = [element.value for element in watched]
         ui.notify(f"Saved {SETTINGS_PATH}", type="positive")
@@ -1959,12 +2009,12 @@ def index(page: Optional[str] = None):
             with ui.column().classes("w-full gap-1 px-6 py-4 border-t border-gray-500/20"):
                 ui.label("Environment").classes("app-overline")
                 with ui.row().classes("items-center gap-1 no-wrap"):
-                    found = CLI_BIN.exists()
+                    found = CLI_PYTHON.exists()
                     ui.icon("check_circle" if found else "error", color="positive" if found else "negative").classes(
                         "text-base"
                     )
                     ui.label("CLI available" if found else "CLI not found").classes("text-xs")
-                ui.label(str(CLI_BIN)).classes("text-[11px] app-muted app-mono break-all")
+                ui.label(str(CLI_PYTHON)).classes("text-[11px] app-muted app-mono break-all")
                 ui.label("Workspace").classes("text-xs mt-2")
                 ui.label(str(WORKSPACE)).classes("text-[11px] app-muted app-mono break-all")
 
@@ -2038,5 +2088,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         host="127.0.0.1",
         port=int(os.environ.get("PAN_OS_GUI_PORT", 8080)),
         reload=False,
-        show=True,
+        show=not os.environ.get("PAN_OS_GUI_NO_BROWSER"),
     )

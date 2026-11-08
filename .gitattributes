@@ -1,2 +1,4 @@
 # Shell scripts must keep Unix line endings, even when checked out with Git for Windows
 *.sh text eol=lf
+# Windows batch files need Windows line endings (also applied to GitHub ZIP downloads)
+*.cmd text eol=crlf

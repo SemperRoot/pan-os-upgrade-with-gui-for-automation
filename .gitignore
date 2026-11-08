@@ -181,3 +181,6 @@ pan_os_upgrade/pyvenv.cfg
 .venv-cli/
 logs/
 .DS_Store
+
+# Offline package folders made with gui/install.py --download
+wheelhouse/

@@ -1,12 +1,15 @@
 # Installing the PAN-OS Upgrade Console on Windows
 
+> **WSL is no longer required.** The CLI and GUI now run natively on Windows, including Windows
+> Server and air-gapped networks: see **[INSTALL.md](INSTALL.md)** (`gui\setup.cmd`, then
+> `gui\start-gui.cmd`). This guide is kept for anyone who prefers to run it inside WSL2.
+
 A step-by-step guide for people who haven't used Linux or a terminal before. It takes 30 to 45
 minutes, most of it waiting for downloads.
 
 When you're done, you'll open the GUI in your normal Windows browser at `http://localhost:8080`.
-It runs inside **WSL2** (Windows Subsystem for Linux), a small Ubuntu Linux system built into
-Windows. The GUI doesn't run upgrades correctly on Windows directly (see
-[Why not directly on Windows](#why-not-directly-on-windows)).
+With this guide it runs inside **WSL2** (Windows Subsystem for Linux), a small Ubuntu Linux system
+built into Windows. To run it directly on Windows instead, use [INSTALL.md](INSTALL.md).
 
 After installing, read [WORKFLOW.md](WORKFLOW.md) for how to run upgrades and [README.md](README.md)
 for how HA pairs are upgraded.
@@ -30,7 +33,7 @@ for how HA pairs are upgraded.
 - [Finding your files from Windows](#finding-your-files-from-windows)
 - [Troubleshooting](#troubleshooting)
 - [What gets installed](#what-gets-installed)
-- [Why not directly on Windows](#why-not-directly-on-windows)
+- [Running directly on Windows](#running-directly-on-windows)
 
 ## Before you start
 
@@ -498,14 +501,15 @@ gui/.venv/bin/pip install -r gui/requirements-gui.txt
 Install the CLI from `requirements-cli.txt`. A plain `pip install .` pulls a newer `click` that
 breaks every CLI command.
 
-## Why not directly on Windows
+## Running directly on Windows
 
-The GUI's pages load on Windows itself, but upgrades depend on Linux features:
+Earlier versions needed WSL because three things only worked on Linux. All three now work on
+Windows too:
 
-- **The password prompt hangs.** The GUI hands the password to the CLI through standard input, but
-  on Windows Python's hidden password prompt reads from the keyboard instead.
-- **Live upgrades can't start.** The confirmation dialog uses the Linux `ps` command, which
-  doesn't exist on Windows.
-- **The Stop button doesn't work.** It uses process signals that Windows doesn't have.
+- **The password prompt.** The GUI starts the CLI through `gui/cli_launcher.py`, which reads the
+  hidden password prompt from standard input on every platform.
+- **The check for other running upgrades** before a live run uses PowerShell's `Get-CimInstance`
+  on Windows instead of `ps`.
+- **The Stop button** ends the CLI with `taskkill` on Windows instead of process signals.
 
-Use WSL2 as described in this guide.
+See [INSTALL.md](INSTALL.md) to install without WSL.

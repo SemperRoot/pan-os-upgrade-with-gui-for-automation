@@ -11,12 +11,18 @@
 >
 > - **[`gui/`](gui/): the PAN-OS Upgrade Console**, a local web GUI that runs the CLI. See
 >   [`gui/WORKFLOW.md`](gui/WORKFLOW.md) for the upgrade workflow, [`gui/README.md`](gui/README.md)
->   for how HA pairs are upgraded, and [`gui/WINDOWS.md`](gui/WINDOWS.md) for installing on Windows.
+>   for how HA pairs are upgraded, and [`gui/INSTALL.md`](gui/INSTALL.md) for installing on Windows or
+>   Linux, including air-gapped networks (no WSL needed).
 >
 > **Changes to the original CLI** (compared with the 1.3.11 release; each file carries a notice):
 >
-> - `pan_os_upgrade/components/assurance.py`: the PDF diff report handles comparisons that return no results.
+> - `pan_os_upgrade/components/assurance.py`: the PDF diff report handles comparisons that return no results;
+>   readiness checks fall back to another English locale when `en_US.UTF-8` isn't available (Windows, minimal Linux).
 > - `pan_os_upgrade/components/upgrade.py`: the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer.
+> - All files the CLI reads and writes use UTF-8 explicitly, so they work on Windows (`main.py`,
+>   `components/assurance.py`, `backup.py`, `upgrade.py`, `utilities.py`).
+> - `requirements.txt` now points to the runtime packages in `gui/requirements-cli.txt` instead of an old
+>   development toolset that couldn't install on Python 3.12+.
 >
 > This fork isn't affiliated with or endorsed by the original author or Palo Alto Networks. The
 > original README follows.
