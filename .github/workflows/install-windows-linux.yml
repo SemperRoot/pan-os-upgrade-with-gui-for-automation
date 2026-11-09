@@ -1,12 +1,23 @@
-name: Install and smoke test (Windows and Linux, no WSL)
+name: Install and smoke test (Windows and Linux)
 
 # Proves the native installers work: gui\setup.cmd on Windows Server 2022, gui/setup-linux.sh on
 # Ubuntu, then gui/smoke_test.py (CLI starts, password reaches the hidden prompt, stop works, GUI serves).
 on:
   push:
-    branches: [norm-remove-wsl-reliance]
+    paths:
+      - "gui/**"
+      - "pan_os_upgrade/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/install-windows-linux.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "gui/**"
+      - "pan_os_upgrade/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/install-windows-linux.yml"
   workflow_dispatch:
 
 jobs:

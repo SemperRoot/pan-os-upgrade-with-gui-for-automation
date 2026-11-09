@@ -1,7 +1,7 @@
 # Installing the PAN-OS Upgrade Console (Windows or Linux, online or offline)
 
 The CLI and the GUI run natively on **Windows** (10, 11, Server 2019, Server 2022) and **Linux**.
-WSL isn't needed. They also work on air-gapped networks: packages can come from an internal PyPI
+For a step-by-step Windows walkthrough, see [WINDOWS.md](WINDOWS.md). They also work on air-gapped networks: packages can come from an internal PyPI
 mirror (Nexus, Artifactory) or from a folder of files you copy in.
 
 > **Tested on:** Windows Server 2022 with Python 3.11, 3.12.1, 3.12 and 3.13 (online, and offline from

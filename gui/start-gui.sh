@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts the PAN-OS Upgrade Console on Linux (or WSL). Run gui/setup-linux.sh once first.
+# Starts the PAN-OS Upgrade Console on Linux. Run gui/setup-linux.sh once first.
 #
 #     bash gui/start-gui.sh
 #

@@ -1,5 +1,5 @@
 @echo off
-rem Installs the pan-os-upgrade CLI and the PAN-OS Upgrade Console on Windows. No WSL needed.
+rem Installs the pan-os-upgrade CLI and the PAN-OS Upgrade Console on Windows.
 rem
 rem   gui\setup.cmd                          packages from pip's configured index (e.g. a Nexus mirror)
 rem   gui\setup.cmd --index-url URL          packages from this index instead

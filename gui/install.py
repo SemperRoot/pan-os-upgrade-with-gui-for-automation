@@ -1,7 +1,7 @@
 """
 Installs the pan-os-upgrade CLI and the PAN-OS Upgrade Console GUI on Windows or Linux.
 
-Needs Python 3.11 or later and nothing else (standard library only). No WSL, no Bash on Windows.
+Needs Python 3.11 or later and nothing else (standard library only).
 
     Windows:  gui\\setup.cmd                 (or:  py -3 gui\\install.py)
     Linux:    bash gui/setup-linux.sh       (or:  python3 gui/install.py)
@@ -132,8 +132,6 @@ def check_project():
         if not (REPO_DIR / name).is_file():
             fail(f"{REPO_DIR / name} is missing.",
                  "This script must stay inside the project's gui folder, and the project must be complete.")
-    if not IS_WINDOWS and str(REPO_DIR).startswith("/mnt/"):
-        note(f"Warning: the project is on a Windows drive ({REPO_DIR}). It works, but it is slow.")
     ok(str(REPO_DIR))
 
 

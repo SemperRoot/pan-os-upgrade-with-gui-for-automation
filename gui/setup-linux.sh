@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the pan-os-upgrade CLI and the PAN-OS Upgrade Console on Linux (any distribution, or WSL).
+# Installs the pan-os-upgrade CLI and the PAN-OS Upgrade Console on Linux (any distribution).
 #
 #     bash gui/setup-linux.sh                          packages from pip's configured index
 #     bash gui/setup-linux.sh --index-url URL          packages from this index (e.g. a Nexus mirror)
@@ -27,7 +27,7 @@ find_python() {
 }
 
 if ! PYTHON="$(find_python)"; then
-    # Debian/Ubuntu (including WSL) often lack only the venv module; install it when apt is available
+    # Debian/Ubuntu often lack only the venv module; install it when apt is available
     if command -v apt-get >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 \
         && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
         printf '\nInstalling python3-venv and python3-pip. If asked, type your Linux password.\n'

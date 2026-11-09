@@ -11,8 +11,8 @@
 >
 > - **[`gui/`](gui/): the PAN-OS Upgrade Console**, a local web GUI that runs the CLI. See
 >   [`gui/WORKFLOW.md`](gui/WORKFLOW.md) for the upgrade workflow, [`gui/README.md`](gui/README.md)
->   for how HA pairs are upgraded, and [`gui/INSTALL.md`](gui/INSTALL.md) for installing on Windows or
->   Linux, including air-gapped networks (no WSL needed).
+>   for how HA pairs are upgraded, [`gui/WINDOWS.md`](gui/WINDOWS.md) for a step-by-step Windows install, and
+>   [`gui/INSTALL.md`](gui/INSTALL.md) for installing on Windows or Linux, including air-gapped networks.
 >
 > **Changes to the original CLI** (compared with the 1.3.11 release; each file carries a notice):
 >

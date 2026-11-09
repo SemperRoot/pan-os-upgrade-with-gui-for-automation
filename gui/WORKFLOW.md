@@ -3,6 +3,7 @@
 How to plan, test, run and verify a PAN-OS upgrade with the GUI, from preparation to the checks
 after the upgrade.
 
+- Installing on Windows, step by step: [WINDOWS.md](WINDOWS.md)
 - Installing on Windows or Linux, including air-gapped networks: [INSTALL.md](INSTALL.md)
 - How HA pairs are upgraded, in detail: [README.md](README.md), also in the GUI under **Help → HA upgrade guide**
 

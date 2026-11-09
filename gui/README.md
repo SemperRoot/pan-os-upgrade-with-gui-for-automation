@@ -14,7 +14,8 @@ below describes that CLI's behavior, mainly in
 
 ## Running the GUI
 
-Install it once as described in [INSTALL.md](INSTALL.md) (Windows or Linux, no WSL needed), then:
+Install it once as described in [WINDOWS.md](WINDOWS.md) (step by step) or [INSTALL.md](INSTALL.md)
+(Windows or Linux), then:
 
 ```bat
 gui\start-gui.cmd
