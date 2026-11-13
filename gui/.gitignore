@@ -2,3 +2,5 @@
 workspace/
 __pycache__/
 .nicegui/
+wheelhouse/
+workspace-smoke-test/

@@ -14,8 +14,15 @@ below describes that CLI's behavior, mainly in
 
 ## Running the GUI
 
+Install it once as described in [WINDOWS.md](WINDOWS.md) (step by step) or [INSTALL.md](INSTALL.md)
+(Windows or Linux), then:
+
+```bat
+gui\start-gui.cmd
+```
+
 ```bash
-gui/.venv/bin/python gui/gui.py
+bash gui/start-gui.sh
 ```
 
 Open <http://localhost:8080>. The GUI only listens on your machine. Runs use their own working

@@ -52,22 +52,15 @@ Encountering issues while using the `pan-os-upgrade` tool is not uncommon, espec
 
 **Solution:** Verify that there is enough disk space for the backup. Check permissions and paths specified for saving the backup files.
 
-### 9. WSL2 Locale Errors
+### 9. Locale Errors
 
-**Problem:** The script fails performing snapshots with the error of: `Error: unsupported locale setting`.
+**Problem:** The script fails performing snapshots or readiness checks with the error
+`unsupported locale setting`.
 
-**Solution:**
-
-1: Open your WSL2 terminal.
-2: Run the command `sudo dpkg-reconfigure locales`.
-3: In the configuration menu, scroll through the list of locales until you find `en_US.UTF-8`.
-4: Use the space bar to select `en_US.UTF-8`.
-5: Press Tab to select "Ok" and press Enter.
-6: When prompted to choose the default locale, select `en_US.UTF-8` again and confirm.
-
-After generating the locale, you can verify it's available by running `locale -a` in the terminal. You should see `en_US.UTF-8` in the list.
-
-If you cannot request `sudo` permissions within WSL2, either use the `pan-os-upgrade` script from the Windows CMD terminal, or use the Docker container.
+**Solution:** In this fork, the readiness checks fall back to another English locale (`C.UTF-8`, the
+Windows `en-US` locale names, or `C`) when `en_US.UTF-8` isn't available, so this error no longer
+occurs. If you still see it, you're running an older copy: update the project and run the installer
+again (see `gui/INSTALL.md`).
 
 ### 10. ARP Table Comparison Failures
 

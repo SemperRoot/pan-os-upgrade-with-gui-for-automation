@@ -1,0 +1,78 @@
+name: Install and smoke test (Windows and Linux)
+
+# Proves the native installers work: gui\setup.cmd on Windows Server 2022, gui/setup-linux.sh on
+# Ubuntu, then gui/smoke_test.py (CLI starts, password reaches the hidden prompt, stop works, GUI serves).
+on:
+  push:
+    paths:
+      - "gui/**"
+      - "pan_os_upgrade/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/install-windows-linux.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "gui/**"
+      - "pan_os_upgrade/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/install-windows-linux.yml"
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-latest]
+        python: ["3.11", "3.12", "3.13"]
+        include:
+          # The testers' exact version. GitHub has no 3.12.1 build for current Ubuntu runners.
+          - os: windows-2022
+            python: "3.12.1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          set PAN_OS_PYTHON=python
+          call gui\setup.cmd
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: gui\.venv\Scripts\python.exe gui\smoke_test.py
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: PAN_OS_PYTHON=python bash gui/setup-linux.sh
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: gui/.venv/bin/python gui/smoke_test.py
+
+  offline-windows:
+    name: windows-2022 / offline wheelhouse install
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.1"
+      - name: Download packages (the internet-connected step)
+        shell: cmd
+        run: python gui\install.py --download wheelhouse
+      - name: Install with no package index
+        shell: cmd
+        env:
+          PIP_INDEX_URL: http://127.0.0.1:9/unreachable
+        run: python gui\install.py --wheelhouse wheelhouse
+      - name: Smoke test
+        shell: cmd
+        run: gui\.venv\Scripts\python.exe gui\smoke_test.py

@@ -3,7 +3,8 @@
 How to plan, test, run and verify a PAN-OS upgrade with the GUI, from preparation to the checks
 after the upgrade.
 
-- Installing on Windows: [WINDOWS.md](WINDOWS.md)
+- Installing on Windows, step by step: [WINDOWS.md](WINDOWS.md)
+- Installing on Windows or Linux, including air-gapped networks: [INSTALL.md](INSTALL.md)
 - How HA pairs are upgraded, in detail: [README.md](README.md), also in the GUI under **Help → HA upgrade guide**
 
 ## The workflow at a glance
@@ -209,7 +210,8 @@ to the upgraded member, and the original active member is upgraded.
 
 ### Stopping a run
 
-**Stop** sends an interrupt, then forces the CLI to exit if it doesn't stop within 10 seconds.
+**Stop** sends an interrupt, then forces the CLI to exit if it doesn't stop within 10 seconds. On
+Windows, which has no interrupt signal for a background process, it ends the CLI immediately.
 **Avoid stopping during download, install or reboot.** A download or install already running on
 a device keeps going there, but the CLI won't reboot it, and an HA member may be left suspended.
 After stopping, check each device's software state and HA state by hand.

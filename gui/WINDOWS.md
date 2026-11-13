@@ -1,257 +1,193 @@
 # Installing the PAN-OS Upgrade Console on Windows
 
-A step-by-step guide for people who haven't used Linux or a terminal before. It takes 30 to 45
+A step-by-step guide for people who haven't used a command window before. It takes 15 to 30
 minutes, most of it waiting for downloads.
 
-When you're done, you'll open the GUI in your normal Windows browser at `http://localhost:8080`.
-It runs inside **WSL2** (Windows Subsystem for Linux), a small Ubuntu Linux system built into
-Windows. The GUI doesn't run upgrades correctly on Windows directly (see
-[Why not directly on Windows](#why-not-directly-on-windows)).
+When you're done, you'll open the GUI in a browser on the same machine at `http://localhost:8080`.
+Everything runs directly on Windows: Windows 10, Windows 11, Windows Server 2019 and Windows
+Server 2022. It also works on networks without internet access.
 
 After installing, read [WORKFLOW.md](WORKFLOW.md) for how to run upgrades and [README.md](README.md)
-for how HA pairs are upgraded.
+for how HA pairs are upgraded. [INSTALL.md](INSTALL.md) is a shorter reference covering Windows and
+Linux.
 
-> **How this guide was tested.** The setup and start scripts were tested on macOS, including a
-> fresh download, a re-run, and a project folder copied from another computer. Ubuntu 24.04's
-> package versions were checked against Ubuntu's package archive, and the Windows commands against
-> Microsoft's WSL documentation. The guide hasn't been run end to end on a Windows PC yet. If a step
-> doesn't match what you see, note the exact message and check [Troubleshooting](#troubleshooting).
+> **How this guide was tested.** The installer, self-check and start script were run on Windows
+> Server 2022 with Python 3.12.1 installed in `C:\Program Files\Python312`, both with internet access
+> and fully offline from a downloaded package folder. They're also tested automatically on Windows
+> Server 2022 with Python 3.11 to 3.13 every time the project changes. If a step doesn't match what
+> you see, note the exact message and check [Troubleshooting](#troubleshooting).
 
 ## Contents
 
 - [Before you start](#before-you-start)
-- [Terminal basics: read this first](#terminal-basics-read-this-first)
-- [Part 1: Install WSL and Ubuntu](#part-1-install-wsl-and-ubuntu)
-- [Part 2: Get the project into Ubuntu](#part-2-get-the-project-into-ubuntu)
-- [Part 3: Run the setup script](#part-3-run-the-setup-script)
-- [Part 4: Start the GUI](#part-4-start-the-gui)
+- [Command Prompt basics: read this first](#command-prompt-basics-read-this-first)
+- [Part 1: Install Python](#part-1-install-python)
+- [Part 2: Get the project](#part-2-get-the-project)
+- [Part 3: Run the setup](#part-3-run-the-setup)
+- [Part 4: Check the installation](#part-4-check-the-installation)
+- [Part 5: Start the GUI](#part-5-start-the-gui)
 - [Every day after that](#every-day-after-that)
 - [Updating to a newer version](#updating-to-a-newer-version)
-- [Finding your files from Windows](#finding-your-files-from-windows)
+- [Where your files are](#where-your-files-are)
 - [Troubleshooting](#troubleshooting)
 - [What gets installed](#what-gets-installed)
-- [Why not directly on Windows](#why-not-directly-on-windows)
 
 ## Before you start
 
-| You need | How to check |
-|----------|--------------|
-| Windows 11, or Windows 10 version 2004 (build 19041) or later | Press **Windows key + R**, type `winver`, press **Enter**. |
-| Administrator rights on the PC, once | You can open programs with **Run as administrator**. On a company PC, IT may need to do Part 1 for you. |
-| Virtualization turned on | **Ctrl + Shift + Esc** opens Task Manager → **Performance** → **CPU**. It should say **Virtualization: Enabled**. |
-| A GitHub account with access to the project | The repository `SemperRoot/pan-os-upgrade-with-gui-for-automation` is private. Ask its owner to invite you (repository **Settings → Collaborators → Add people**), then accept the email invitation. |
-| Internet access | To download Ubuntu and the Python packages. |
-| About 2 GB of free disk space | |
+| You need | Notes |
+|----------|-------|
+| Windows 10 or 11, or Windows Server 2019 or 2022 | Press **Windows key + R**, type `winver`, press **Enter** to check. |
+| Python 3.11, 3.12 or 3.13 | Part 1 explains how to install it. If it's already installed, Part 1 shows how to check. |
+| A source for Python packages | One of: internet access, your organization's internal PyPI mirror (for example Nexus or Artifactory), or a package folder downloaded on another machine. See [Part 3](#part-3-run-the-setup). |
+| The project files | As a ZIP from GitHub or your internal Git server (Part 2). The GitHub repository `SemperRoot/pan-os-upgrade-with-gui-for-automation` is private: ask its owner to invite your GitHub account, then accept the email invitation. |
+| A web browser on the same machine | Edge, Chrome or Firefox. The GUI only accepts connections from the machine it runs on. |
+| HTTPS access to the firewalls and Panorama | From this machine to each device's management address (port 443). |
+| About 500 MB of free disk space | |
 
-**Don't copy the project folder from a Mac or another PC.** Always get it from GitHub (Part 2). A
-copied folder contains files made for the other computer. The setup script can clean those up,
-but it's the most common source of problems.
+Administrator rights are only needed if Python isn't installed yet and you install it for all
+users. The project itself installs into its own folder and changes nothing else on the machine.
 
-## Terminal basics: read this first
+**Don't copy a project folder that was already set up on another computer.** Start from a fresh ZIP
+(Part 2). The setup can repair a copied folder, but it's the most common source of problems.
 
-You'll type commands into two different windows. Each step says which one.
+## Command Prompt basics: read this first
 
-| Window | What it is | How to open it |
-|--------|------------|----------------|
-| **PowerShell** | Windows' own command window. Only used in Part 1. | Start menu → type `PowerShell`. |
-| **Ubuntu** | The Linux command window. Used for everything else. | Start menu → type `Ubuntu` → **Ubuntu 24.04**. |
+All commands in this guide go into **Command Prompt**, Windows' standard command window. Don't use
+PowerShell for them.
 
-How to work in these windows:
+**Opening Command Prompt in the project folder** (the easiest way, used throughout this guide):
+
+1. Open the project folder in **File Explorer**, for example `C:\pan-os-upgrade`.
+2. Click in the **address bar** at the top, where the folder path is shown.
+3. Type `cmd` and press **Enter**.
+
+A black window opens, with a line ending in `>` that shows the folder, for example:
+
+```
+C:\pan-os-upgrade>
+```
+
+How to work in Command Prompt:
 
 - **Run one command at a time.** Copy a command from this guide, paste it into the window, press
-  **Enter**, and wait until the line ending in `$` comes back before running the next one. In
-  Ubuntu that line looks like `jane@DESKTOP-AB12CD:~$`.
-- **Pasting:** right-click in the window, or press **Ctrl + Shift + V**. Plain **Ctrl + V** works in
-  newer Windows versions; if it types `^V` instead, use right-click.
-- **Copying text from the window:** select it with the mouse, then press **Ctrl + Shift + C** or
-  right-click.
-- **Ctrl + C does not copy in these windows.** It stops whatever is running.
-- **Passwords stay invisible.** When Ubuntu asks for your password, nothing appears as you type,
-  not even dots. Type it and press **Enter**.
-- **`~` means your Linux home folder**, for example `/home/jane`.
-- **Capital letters and spaces matter.** Copy commands exactly.
+  **Enter**, and wait until the line ending in `>` comes back before running the next one.
+- **Pasting:** press **Ctrl + V**, or right-click in the window.
+- **Copying text from the window:** select it with the mouse, then press **Enter** or right-click.
+- **Ctrl + C does not copy here.** It stops whatever is running.
+- **Copy commands exactly**, including spaces and backslashes (`\`).
 
-## Part 1: Install WSL and Ubuntu
+## Part 1: Install Python
 
-### 1.1 Open PowerShell as administrator
+### 1.1 Check whether Python is already installed
 
-1. Open the **Start** menu and type `PowerShell`.
-2. Right-click **Windows PowerShell** and choose **Run as administrator**.
-3. Click **Yes** when Windows asks for permission.
+Open Command Prompt (Start menu → type `cmd` → **Command Prompt**) and run:
 
-### 1.2 Install WSL with Ubuntu 24.04
-
-**In PowerShell (administrator):**
-
-```powershell
-wsl --install -d Ubuntu-24.04
+```bat
+py --version
 ```
 
-It downloads and installs for a few minutes. When it says changes take effect after a reboot,
-**restart the PC**.
+- If it shows **Python 3.11**, **3.12** or **3.13**, Python is ready. Go to [Part 2](#part-2-get-the-project).
+- If it shows an older version, such as **Python 3.10**, or says `'py' is not recognized`, continue
+  with 1.2.
 
-- If the command only prints help text, WSL is already installed. Run it again exactly as shown,
-  with `-d Ubuntu-24.04`.
-- If the progress stays at 0.0%, close the window, open PowerShell as administrator again, and run:
-  `wsl --install --web-download -d Ubuntu-24.04`
+### 1.2 Download the installer
 
-### 1.3 Create your Ubuntu user
+On a machine with internet access, go to **<https://www.python.org/downloads/windows/>** and download
+the **Windows installer (64-bit)** for the latest **Python 3.12** release. Python 3.11 and 3.13 work
+too.
 
-After the restart, an Ubuntu window usually opens by itself. If not: **Start** menu → type
-`Ubuntu` → **Ubuntu 24.04**.
+On an offline network, copy the installer file (for example `python-3.12.10-amd64.exe`) to the
+machine on a USB drive or through your usual file transfer process. Your IT team may also already
+provide Python through software distribution.
 
-1. Wait while it says it's installing. This happens only the first time.
-2. When asked for a **username**, type a short name in lowercase with no spaces, for example
-   `jane`, and press **Enter**.
-3. When asked for a **password**, type one and press **Enter**. Nothing appears while you type.
-   Type it again to confirm.
+### 1.3 Run the installer
 
-**Write this password down.** Ubuntu asks for it when installing software. It doesn't need to match
-your Windows password.
+1. Double-click the installer.
+2. At the bottom of the first screen, tick **Add python.exe to PATH**.
+3. Choose one:
+   - **Install Now** installs for your user only and needs no administrator rights.
+   - **Customize installation** → **Next** → tick **Install Python for all users** → **Install**
+     installs to `C:\Program Files\Python312` for everyone. This needs administrator rights.
+4. When it says **Setup was successful**, click **Close**.
 
-**You should now see** a line like:
+### 1.4 Check it
 
-```
-jane@DESKTOP-AB12CD:~$
-```
+Open a **new** Command Prompt window (a window opened before the install doesn't see Python yet) and
+run:
 
-### 1.4 Check that it's WSL version 2
-
-Open a normal **PowerShell** window (not administrator) and run:
-
-```powershell
-wsl -l -v
+```bat
+py --version
 ```
 
-**You should see** `Ubuntu-24.04` with `2` in the **VERSION** column. If it shows `1`, run:
+**You should see** `Python 3.12.x` (or the version you installed).
 
-```powershell
-wsl --set-version Ubuntu-24.04 2
-```
+## Part 2: Get the project
 
-## Part 2: Get the project into Ubuntu
+### 2.1 Download the ZIP
 
-The project has to live **inside Ubuntu's own folders**, not just in your Windows Downloads
-folder. Pick **one** option. Option A is recommended because updating later is a single command.
+1. In a browser, sign in to GitHub and open
+   **<https://github.com/SemperRoot/pan-os-upgrade-with-gui-for-automation>**, or open the project on
+   your internal Git server.
+2. Click the green **Code** button, then **Download ZIP**.
 
-### Option A (recommended): download with the GitHub command-line tool
+On an offline network, download the ZIP on a connected machine and transfer it the same way as the
+Python installer.
 
-**In Ubuntu**, run these one at a time. The first one asks for your Ubuntu password.
+### 2.2 Unblock and extract it
 
-```bash
-sudo apt update
-```
+1. In File Explorer, right-click the ZIP file and choose **Properties**. If there's an **Unblock**
+   checkbox at the bottom, tick it and click **OK**. This stops Windows from showing security
+   warnings for every file inside.
+2. Right-click the ZIP again, choose **Extract All...**, type `C:\` as the destination, and click
+   **Extract**.
+3. In File Explorer, go to `C:\`. Rename the new folder (named like
+   `pan-os-upgrade-with-gui-for-automation-main`) to **`pan-os-upgrade`**.
 
-```bash
-sudo apt install -y git gh
-```
+A short path such as `C:\pan-os-upgrade` avoids problems with Windows' path length limit. Any folder
+you can write to works, but avoid very long paths and folders synced by OneDrive or Google Drive.
 
-Log in to GitHub:
+### 2.3 Check the folder
 
-```bash
-gh auth login
-```
-
-It asks a few questions. Use the arrow keys and **Enter** to choose:
-
-| Question about | Choose |
-|----------------|--------|
-| Which GitHub / account | **GitHub.com** |
-| Preferred protocol | **HTTPS** |
-| Authenticate Git with your GitHub credentials | **Yes** (press **Enter**) |
-| How to authenticate | **Login with a web browser** |
-
-It then shows a **one-time code** like `ABCD-1234`.
-
-1. Write the code down, or select it and press **Ctrl + Shift + C**.
-2. Press **Enter**. On WSL the browser often doesn't open by itself. If nothing opens, go to
-   **<https://github.com/login/device>** in your Windows browser.
-3. Sign in to GitHub if asked, enter the code, and click **Authorize**.
-
-Back in Ubuntu it should say **Logged in as** your GitHub username.
-
-Download the project:
-
-```bash
-gh repo clone SemperRoot/pan-os-upgrade-with-gui-for-automation ~/pan-os-upgrade
-```
-
-Now go to [Check the download](#check-the-download).
-
-### Option B: download a ZIP file
-
-**In your Windows browser:**
-
-1. Sign in to GitHub and open
-   **<https://github.com/SemperRoot/pan-os-upgrade-with-gui-for-automation>**.
-2. Click the green **Code** button, then **Download ZIP**. The file
-   `pan-os-upgrade-with-gui-for-automation-main.zip` lands in your **Downloads** folder.
-
-**Move the ZIP into Ubuntu.** In **Ubuntu**, run:
-
-```bash
-cd ~
-```
-
-```bash
-explorer.exe .
-```
-
-Don't miss the dot at the end. A **File Explorer** window opens showing your Ubuntu home folder.
-Drag the ZIP file from your **Downloads** folder into that window.
-
-If a file ending in `:Zone.Identifier` appears next to the ZIP, ignore it. Windows adds it, and
-it's harmless.
-
-**Unzip it.** In **Ubuntu**, run these one at a time:
-
-```bash
-sudo apt update
-```
-
-```bash
-sudo apt install -y unzip
-```
-
-```bash
-unzip -q ~/pan-os-upgrade-with-gui-for-automation-main.zip -d ~
-```
-
-```bash
-mv ~/pan-os-upgrade-with-gui-for-automation-main ~/pan-os-upgrade
-```
-
-If `mv` succeeds, it prints nothing. If a `pan-os-upgrade` folder already existed from an earlier
-attempt, see [the project is inside another folder](#the-project-is-inside-another-folder).
-
-### Check the download
-
-**In Ubuntu:**
-
-```bash
-ls ~/pan-os-upgrade
-```
-
-**You should see** these names, among others:
+Open `C:\pan-os-upgrade` in File Explorer. **You should see** these items, among others:
 
 ```
-LICENSE  README.md  gui  pan_os_upgrade  pyproject.toml  ...
+gui    pan_os_upgrade    LICENSE    pyproject.toml    README.md
 ```
 
-If you see a single folder name instead, or `No such file or directory`, fix it before
-continuing: see [Problems in Part 2](#problems-in-part-2).
+If you see a single folder instead, the project is one level too deep: see
+[Problems in Part 2](#problems-in-part-2).
 
-## Part 3: Run the setup script
+## Part 3: Run the setup
 
-The script installs everything and checks each step. It works from any folder.
+The setup creates two private Python environments inside the project folder, installs the right
+package versions into them, and checks that everything starts. It never changes your system Python.
 
-**In Ubuntu:**
+1. Open Command Prompt in `C:\pan-os-upgrade`. Type `cmd` in File Explorer's address bar, as
+   described in [Command Prompt basics](#command-prompt-basics-read-this-first).
+2. Run **one** of the commands below, depending on where Python packages come from on your network.
 
-```bash
-bash ~/pan-os-upgrade/gui/setup-wsl.sh
+**Internet access, or pip is already set up for your organization's mirror:**
+
+```bat
+gui\setup.cmd
 ```
 
-- It may ask for your **Ubuntu password**, which stays invisible while you type.
+**Your organization's PyPI mirror (Nexus, Artifactory):** ask IT for the mirror's PyPI proxy address
+(it usually ends in `/simple`) and use it in place of the example:
+
+```bat
+gui\setup.cmd --index-url https://nexus.example.local/repository/pypi-proxy/simple
+```
+
+**No network at all:** use a package folder made on another machine, as described in
+[Installing without any network](#installing-without-any-network) below:
+
+```bat
+gui\setup.cmd --wheelhouse wheelhouse
+```
+
+What to expect:
+
 - It takes **3 to 10 minutes**. Lines starting with `==>` are the steps; `OK:` means a step worked.
 - Don't close the window while it runs.
 
@@ -259,27 +195,83 @@ bash ~/pan-os-upgrade/gui/setup-wsl.sh
 
 ```
 ==> Installing the CLI into .venv-cli (takes a few minutes)
-    OK: pan-os-upgrade installed: /home/jane/pan-os-upgrade/.venv-cli/bin/pan-os-upgrade
+    OK: pan-os-upgrade installed: C:\pan-os-upgrade\.venv-cli
 
 ==> Installing the GUI into gui/.venv
-    OK: GUI installed: /home/jane/pan-os-upgrade/gui/.venv
+    OK: GUI installed: C:\pan-os-upgrade\gui\.venv
 
 ==> Setup complete
     Start the GUI with:
 
-        bash /home/jane/pan-os-upgrade/gui/start-gui.sh
+        "C:\pan-os-upgrade\gui\start-gui.cmd"
+
+    Then open http://localhost:8080 in your web browser.
 ```
 
 If it stops with a red **ERROR** line, read the message under it; it says what to do. Then see
-[Problems in Part 3](#problems-in-part-3). You can run the script again as often as needed.
+[Problems in Part 3](#problems-in-part-3). You can run the setup again as often as needed.
 
-## Part 4: Start the GUI
+**Don't run `pip install -r requirements.txt` yourself.** The setup creates the separate
+environments the CLI and the GUI need, with the right versions.
 
-**In Ubuntu:**
+### Installing without any network
 
-```bash
-bash ~/pan-os-upgrade/gui/start-gui.sh
+This needs a second Windows machine **with internet access** and the **same Python minor version**
+(for example 3.12 on both).
+
+1. On the connected machine, extract the project ZIP and open Command Prompt in its folder, as in
+   Parts 2 and 3.
+2. Run:
+
+   ```bat
+   py -3 gui\install.py --download wheelhouse
+   ```
+
+   It creates a folder named `wheelhouse` inside the project, with about 80 files (about 40 MB).
+3. Copy the **whole project folder**, including `wheelhouse`, to the offline machine, for example
+   to `C:\pan-os-upgrade`.
+4. On the offline machine, run `gui\setup.cmd --wheelhouse wheelhouse` as shown above.
+
+With `--wheelhouse`, the setup doesn't try to contact any server.
+
+### Choosing a specific Python
+
+The setup uses the newest Python found by the `py` command. To use a particular installation
+instead, set `PAN_OS_PYTHON` in the same window before running the setup, for example:
+
+```bat
+set PAN_OS_PYTHON="C:\Program Files\Python312\python.exe"
+gui\setup.cmd
 ```
+
+## Part 4: Check the installation
+
+This runs a few quick checks without contacting any real firewall. In the same Command Prompt
+window, run:
+
+```bat
+gui\.venv\Scripts\python.exe gui\smoke_test.py
+```
+
+**You should see** six lines starting with `PASS`, ending with:
+
+```
+6 of 6 checks passed.
+```
+
+One check briefly tries to reach `192.0.2.1`. That address is reserved for documentation and never
+answers. The check uses it to confirm that a password typed in the GUI reaches the upgrade tool. If
+any line says `FAIL`, see [Problems in Part 4](#problems-in-part-4).
+
+## Part 5: Start the GUI
+
+In the same Command Prompt window, run:
+
+```bat
+gui\start-gui.cmd
+```
+
+You can also double-click `start-gui.cmd` in the `C:\pan-os-upgrade\gui` folder.
 
 **You should see:**
 
@@ -289,96 +281,45 @@ bash ~/pan-os-upgrade/gui/start-gui.sh
   Keep this window open while you use the GUI. Press Ctrl+C here to stop it.
 ```
 
-A message about not being able to open a browser may follow; that's normal on WSL.
+Your browser usually opens by itself. If it doesn't:
 
-1. Open your normal Windows browser (Edge, Chrome or Firefox).
+1. Open Edge, Chrome or Firefox on the same machine.
 2. Go to **<http://localhost:8080>**.
-3. At the bottom of the left-hand menu, under **Environment**, check that it says **CLI available**.
 
-**Keep the Ubuntu window open** while you use the GUI. Closing it stops the GUI. To stop the GUI on
-purpose, click the Ubuntu window and press **Ctrl + C**. Don't do this during an upgrade; see
+At the bottom of the left-hand menu, under **Environment**, check that it says **CLI available**.
+
+**Keep the Command Prompt window open** while you use the GUI. Closing it stops the GUI. To stop the
+GUI on purpose, click the window and press **Ctrl + C**, then answer `Y` if asked
+`Terminate batch job (Y/N)?`. Don't do this during an upgrade; see
 [WORKFLOW.md](WORKFLOW.md#stopping-a-run).
 
 You're done. Continue with [WORKFLOW.md](WORKFLOW.md).
 
 ## Every day after that
 
-1. **Start** menu → **Ubuntu 24.04**.
-2. Run:
+Double-click `C:\pan-os-upgrade\gui\start-gui.cmd`, then open **<http://localhost:8080>** if the
+browser doesn't open by itself.
 
-   ```bash
-   bash ~/pan-os-upgrade/gui/start-gui.sh
-   ```
-
-3. Open **<http://localhost:8080>**.
-
-**Optional shortcut.** Run this once:
-
-```bash
-echo "alias pan-gui='bash ~/pan-os-upgrade/gui/start-gui.sh'" >> ~/.bashrc
-```
-
-Close and reopen Ubuntu. From then on, typing `pan-gui` starts the GUI.
+**Optional shortcut:** right-click `start-gui.cmd` → **Show more options** (Windows 11 only) →
+**Send to** → **Desktop (create shortcut)**. You can then start the GUI from the desktop.
 
 ## Updating to a newer version
 
-Your settings, inventory, run history and reports in `gui/workspace/` are kept in both options.
+Your settings, inventory, run history, reports and backups are all in `gui\workspace` and are kept.
 
-**If you used Option A (GitHub tool):**
+1. Download and unblock the new ZIP as in [Part 2](#part-2-get-the-project).
+2. Rename the current folder `C:\pan-os-upgrade` to `C:\pan-os-upgrade-old`.
+3. Extract the new ZIP to `C:\` and rename the new folder to `pan-os-upgrade`.
+4. Move the `workspace` folder from `C:\pan-os-upgrade-old\gui` into `C:\pan-os-upgrade\gui`.
+5. Run the setup again ([Part 3](#part-3-run-the-setup)) with the same command as before. For an
+   offline install, make a new `wheelhouse` folder for the new version first.
 
-```bash
-cd ~/pan-os-upgrade
-```
+Once the new version works, you can delete `C:\pan-os-upgrade-old`.
 
-```bash
-git pull
-```
+## Where your files are
 
-```bash
-bash ~/pan-os-upgrade/gui/setup-wsl.sh
-```
-
-**If you used Option B (ZIP):** download the new ZIP and drag it into your Ubuntu home folder as
-before. Then run these one at a time. They set the old folder aside, unpack the new one, and move
-your saved data across:
-
-```bash
-mv ~/pan-os-upgrade ~/pan-os-upgrade-old
-```
-
-```bash
-unzip -q ~/pan-os-upgrade-with-gui-for-automation-main.zip -d ~
-```
-
-```bash
-mv ~/pan-os-upgrade-with-gui-for-automation-main ~/pan-os-upgrade
-```
-
-```bash
-mv ~/pan-os-upgrade-old/gui/workspace ~/pan-os-upgrade/gui/
-```
-
-```bash
-bash ~/pan-os-upgrade/gui/setup-wsl.sh
-```
-
-Once the new version works, you can delete `~/pan-os-upgrade-old` and the ZIP.
-
-## Finding your files from Windows
-
-Reports (PDFs), logs and configuration backups are inside Ubuntu at
-`~/pan-os-upgrade/gui/workspace/`. To open that folder in File Explorer, run in Ubuntu:
-
-```bash
-explorer.exe ~/pan-os-upgrade/gui/workspace
-```
-
-Or type this in File Explorer's address bar, replacing `jane` with your Ubuntu username:
-
-```
-\\wsl.localhost\Ubuntu-24.04\home\jane\pan-os-upgrade\gui\workspace
-```
-
+Everything the GUI creates is in `C:\pan-os-upgrade\gui\workspace`: reports (including PDFs), logs,
+configuration backups, settings and the inventory. Open that folder in File Explorer as usual.
 [WORKFLOW.md](WORKFLOW.md#where-the-gui-keeps-things) lists which file is where.
 
 ## Troubleshooting
@@ -387,125 +328,82 @@ Or type this in File Explorer's address bar, replacing `jane` with your Ubuntu u
 
 | What you see | What to do |
 |--------------|------------|
-| A message about enabling **Virtual Machine Platform** or virtualization in the BIOS, or error `0x80370102` | Virtualization is off. It's turned on in the PC's BIOS/UEFI settings (often called **Intel VT-x**, **Intel Virtualization Technology** or **AMD-V/SVM**). On a company PC, ask IT. |
-| `WslRegisterDistribution failed with error: 0x8007019e` | WSL isn't enabled yet. Run `wsl --install -d Ubuntu-24.04` in PowerShell **as administrator**, then restart the PC. |
-| `wsl --install` only prints help text | WSL is already installed. Run `wsl --install -d Ubuntu-24.04` exactly as shown. |
-| Install stuck at 0.0% | Run `wsl --install --web-download -d Ubuntu-24.04` in PowerShell as administrator. |
-| `wsl -l -v` shows VERSION `1` | Run `wsl --set-version Ubuntu-24.04 2`. |
-| You forgot your Ubuntu password | In PowerShell, run `wsl -d Ubuntu-24.04 -u root passwd jane`, replacing `jane` with your Ubuntu username, and set a new one. |
-| Pasting types `^V` | Right-click to paste, or press **Ctrl + Shift + V**. |
+| `'py' is not recognized as an internal or external command` | Python isn't installed, or was installed without the `py` launcher. Install it as in Part 1.3, then open a **new** Command Prompt window. |
+| `py --version` shows Python 3.10 or older | Install Python 3.12 (Part 1). Older versions can stay installed; `py` uses the newest one. |
+| The installer says you need administrator rights | Choose **Install Now** (for your user only), or ask IT to install Python for all users. |
+| Python opens the Microsoft Store | That's a Windows shortcut, not real Python. Install Python from python.org as in Part 1, or use `py` instead of `python`. |
 
 ### Problems in Part 2
 
 | What you see | What to do |
 |--------------|------------|
-| `gh: command not found` | Run `sudo apt update`, then `sudo apt install -y git gh`. |
-| `E: Unable to locate package gh` | Run `sudo apt update` first. If it still fails, check you installed **Ubuntu 24.04** (`lsb_release -a`). |
-| The browser didn't open during `gh auth login` | Normal on WSL. Open <https://github.com/login/device> in your Windows browser and enter the code. |
-| `GraphQL: Could not resolve to a Repository` or `repository not found` | Your GitHub account doesn't have access, or you logged in with a different account. Run `gh auth status` to see which account is logged in, and ask the owner for an invitation (then accept it from the email). |
-| `fatal: destination path '/home/jane/pan-os-upgrade' already exists` | An earlier attempt left a folder. Set it aside with `mv ~/pan-os-upgrade ~/pan-os-upgrade-old`, then run the clone command again. |
-| `unzip: cannot find or open ...zip` | The ZIP isn't in your Ubuntu home folder, or has a different name. Run `ls ~/*.zip` to see what's there. If it was downloaded twice, Windows may have named it `...-main (1).zip`. |
-| `cannot stat` or `No such file or directory` after `mv` | The unzipped folder has a different name. Run `ls ~` and use the name you see. |
-| `ls ~/pan-os-upgrade` says `No such file or directory` | The project isn't in the expected place. Run `ls ~` to see what's in your home folder, then redo Option A or B. |
-
-#### The project is inside another folder
-
-If `ls ~/pan-os-upgrade` shows a **single folder name** instead of `README.md`, `gui` and so on, the
-project ended up one level too deep. This happens when `pan-os-upgrade` already existed when you ran
-`mv`. Fix it by setting the folders aside and moving the inner one into place:
-
-```bash
-mv ~/pan-os-upgrade ~/pan-os-upgrade-outer
-```
-
-```bash
-ls ~/pan-os-upgrade-outer
-```
-
-Note the folder name that appears, then run the next command with that name in place of `NAME`:
-
-```bash
-mv ~/pan-os-upgrade-outer/NAME ~/pan-os-upgrade
-```
-
-Check again with `ls ~/pan-os-upgrade`.
+| GitHub shows **404 This is not the web page you are looking for** | Your GitHub account doesn't have access, or you aren't signed in. Ask the owner for an invitation, accept it from the email, and sign in. |
+| `C:\pan-os-upgrade` contains a single folder instead of `gui`, `README.md` and so on | The project ended up one level too deep. Open that inner folder, select everything inside (**Ctrl + A**), cut it (**Ctrl + X**), go back up to `C:\pan-os-upgrade`, paste (**Ctrl + V**), then delete the now-empty inner folder. |
+| Windows shows a security warning every time you open a file from the project | The ZIP wasn't unblocked before extracting. Delete the folder, unblock the ZIP (Part 2.2), and extract it again. |
+| `Path too long` or `destination path too long` while extracting | Extract to `C:\` as described, not into a deep folder. |
 
 ### Problems in Part 3
 
 | What you see | What to do |
 |--------------|------------|
-| `bash: /home/jane/pan-os-upgrade/gui/setup-wsl.sh: No such file or directory` | The project isn't at `~/pan-os-upgrade`, or it's an old copy from before the setup script existed. Run `ls ~/pan-os-upgrade/gui`. If `setup-wsl.sh` isn't listed, get a fresh copy with Part 2. |
-| `ERROR: ... is missing.` | The project folder is incomplete. Get a fresh copy with Part 2. |
-| `$'\r': command not found` (or `^M: command not found`), or `set: pipefail` followed by `invalid option name` | The script's line endings were changed to Windows format, usually by opening it in a Windows editor or copying it through Windows. Fix with `sed -i 's/\r$//' ~/pan-os-upgrade/gui/*.sh`, then run the setup again. |
-| `Python 3.10 is too old` | You're on an older Ubuntu. Install Ubuntu 24.04 (Part 1.2) and redo the guide inside it. |
-| `[sudo] password for jane:` then `Sorry, try again.` | Wrong Ubuntu password. It's the one from Part 1.3, not your Windows password. If forgotten, see Part 1 problems. |
-| Package downloads fail with `SSL`, `certificate` or `proxy` errors, or time out | Your network uses a proxy or inspects encrypted traffic, which is common on company networks. Ask IT for the proxy address and set it before running the script, for example `export https_proxy=http://proxy.example.com:8080`. IT may also need to provide a certificate. |
-| `error: externally-managed-environment` | You ran `pip install` by hand outside the project's environments. Don't; run the setup script instead. |
-| `pan-os-upgrade doesn't start` with `make_metavar` in the message | A wrong `click` version was installed. Run the setup script again; it installs the right one. |
-| `ERROR: The en_US.UTF-8 locale isn't available.` | Ubuntu couldn't set up the US English locale that readiness checks need. Run `sudo apt install -y locales`, then `sudo locale-gen en_US.UTF-8`, then run the setup script again. |
+| `'gui\setup.cmd' is not recognized` | Command Prompt isn't open in the project folder. Run `cd /d C:\pan-os-upgrade` and try again. |
+| `ERROR: Python wasn't found` | See Problems in Part 1. To use a specific installation, set `PAN_OS_PYTHON` as described in [Choosing a specific Python](#choosing-a-specific-python). |
+| `ERROR: Python 3.x is too old` | `py` found an old Python. Install Python 3.12, or set `PAN_OS_PYTHON` to a newer one. |
+| `pip couldn't download a package`, `No matching distribution found`, or downloads time out | pip can't reach a package source. Check the `--index-url` address with IT, or use the offline method. To see pip's current settings, run `py -3 -m pip config list`. |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | Your mirror or proxy uses a certificate that Python doesn't trust. Get the certificate file (`.pem`) from IT and run `py -3 -m pip config set global.cert C:\path\to\certificate.pem`, then run the setup again. |
+| Downloads fail with `proxy` errors | Your network needs a proxy. Ask IT for its address and set it in the same window before running the setup, for example `set HTTPS_PROXY=http://proxy.example.local:8080`. |
+| `A package is missing from ...wheelhouse` | The `wheelhouse` folder was made with a different Python version or on a different operating system. Make it again on a Windows machine with the same Python minor version. |
+| No module named `imp` while installing **pathtools** | You ran `pip install -r requirements.txt` from an old copy of the project. Get a current copy and use `gui\setup.cmd`. |
+| `The CLI's packages conflict` | Delete the `.venv-cli` folder inside the project and run the setup again. |
+| `Running scripts is disabled on this system` | You ran the setup from PowerShell. Use **Command Prompt** instead; the setup doesn't use PowerShell scripts. |
 
 ### Problems in Part 4
 
 | What you see | What to do |
 |--------------|------------|
-| `ERROR: The GUI isn't installed` or `The CLI isn't installed` | Run the setup script (Part 3) first, and check that it ends with **Setup complete**. |
-| The menu says **CLI not found** | You started `gui.py` directly instead of using `start-gui.sh`. Stop it with **Ctrl + C** and use the start command from Part 4. |
-| `http://localhost:8080` doesn't load | Check the Ubuntu window is still open and showing the GUI's messages. Try **<http://127.0.0.1:8080>**. If it still fails, see [Mirrored networking](#mirrored-networking). |
-| `address already in use` | The GUI is already running in another Ubuntu window, or another program uses port 8080. Close the other window, or start on another port: `PAN_OS_GUI_PORT=8081 bash ~/pan-os-upgrade/gui/start-gui.sh`, then open `http://localhost:8081`. |
-| The GUI works, but firewalls or Panorama can't be reached | Test from Ubuntu: `curl -k https://FIREWALL-ADDRESS` (an HTML reply means it's reachable). Company VPNs sometimes block WSL; [mirrored networking](#mirrored-networking) often fixes this. |
-| A message about not being able to open a browser | Normal on WSL. Open the address in your Windows browser yourself. |
-| A run stops with `generated an exception: unsupported locale setting` | Ubuntu is missing the US English locale that readiness checks need. Setups made before the setup script handled this are affected. Stop the GUI, run the setup script again (Part 3), and start the GUI again. If it's an HA pair, check both firewalls with `show high-availability state` before re-running, and make any member left `suspended` functional again. |
+| `The system cannot find the path specified` | The setup didn't finish. Run it again (Part 3) and check that it ends with **Setup complete**. |
+| `FAIL  CLI is installed` or `FAIL  CLI starts` | Run the setup again. If it still fails, copy the lines under the `FAIL` line and send them to the project owner. |
+| `FAIL  GUI web server starts` | Another program may be using the port. Close other copies of the GUI and run the check again. |
+| Any other `FAIL` | Copy the whole output and send it to the project owner. |
 
-#### Mirrored networking
+### Problems in Part 5
 
-Mirrored networking makes Ubuntu share Windows' network connection, which fixes most `localhost`
-and VPN problems. It needs Windows 11 version 22H2 or later.
-
-1. In File Explorer, go to your Windows user folder (type `%USERPROFILE%` in the address bar).
-2. Create a text file named `.wslconfig` (with the dot, no `.txt` at the end) containing:
-
-   ```
-   [wsl2]
-   networkingMode=mirrored
-   ```
-
-3. In PowerShell, run `wsl --shutdown`.
-4. Open Ubuntu again and start the GUI.
+| What you see | What to do |
+|--------------|------------|
+| `ERROR: The GUI isn't installed` or `The CLI isn't installed` | Run the setup (Part 3) first, and check that it ends with **Setup complete**. |
+| The menu says **CLI not found** | The CLI isn't in `C:\pan-os-upgrade\.venv-cli`. Run the setup again. If you installed the CLI somewhere else, set `PAN_OS_UPGRADE_PYTHON` to that environment's `Scripts\python.exe` before starting the GUI. |
+| `http://localhost:8080` doesn't load | Check that the Command Prompt window is still open and shows the GUI's messages. Try **<http://127.0.0.1:8080>**. Use a browser on the same machine; the GUI doesn't accept connections from other computers. |
+| `error while attempting to bind on address` or `address already in use` | The GUI is already running in another window, or another program uses port 8080. Close the other window, or use another port: run `set PAN_OS_GUI_PORT=8081`, then `gui\start-gui.cmd`, and open `http://localhost:8081`. |
+| The GUI works, but firewalls or Panorama can't be reached | Test from Command Prompt with `curl.exe -k https://FIREWALL-ADDRESS`. An HTML reply means the device is reachable. If it times out, check routing and firewall rules between this machine and the devices' management addresses. |
+| Windows Defender Firewall asks whether to allow Python | Click **Cancel** or allow it for **Private networks** only. The GUI only listens on this machine and doesn't need network access from others. Outgoing connections to firewalls work either way. |
 
 ## What gets installed
 
 | Where | What |
 |-------|------|
-| Windows | WSL2 and Ubuntu 24.04 (Part 1). |
-| Ubuntu system packages | `python3` (3.12), `python3-venv`, `python3-pip`, `git`; plus `gh` (Option A) or `unzip` (Option B). |
-| Ubuntu locale | `en_US.UTF-8`, generated with `locale-gen` if missing. The readiness checks switch to it to read dates in firewall output. |
-| `~/pan-os-upgrade/.venv-cli` | The `pan-os-upgrade` CLI with the 32 packages pinned in [`requirements-cli.txt`](requirements-cli.txt), including `pan-os-python`, `panos-upgrade-assurance`, `typer` 0.9.4 and `click` 8.1.8. |
-| `~/pan-os-upgrade/gui/.venv` | The GUI's packages from [`requirements-gui.txt`](requirements-gui.txt): `nicegui` 3.18.0 and `PyYAML` 6.0.3, plus their own dependencies. |
+| `C:\pan-os-upgrade\.venv-cli` | The `pan-os-upgrade` CLI with the 32 packages pinned in [`requirements-cli.txt`](requirements-cli.txt), including `pan-os-python`, `panos-upgrade-assurance`, `typer` 0.9.4 and `click` 8.1.8. |
+| `C:\pan-os-upgrade\gui\.venv` | The GUI's packages from [`requirements-gui.txt`](requirements-gui.txt): `nicegui` 3.18.0 and `PyYAML` 6.0.3, plus their own dependencies. |
+| `C:\pan-os-upgrade\gui\workspace` | Created on first use: your settings, inventory, logs, reports and backups. |
 
-The CLI and the GUI use separate environments, and nothing is installed into Ubuntu's system Python.
+The CLI and the GUI use separate environments, and nothing is installed into the system Python or
+anywhere else on the machine. To uninstall, delete the project folder (keep `gui\workspace` first if
+you want your reports and backups).
 
-**Installing by hand** (only if you can't use the script), from inside `~/pan-os-upgrade`:
+**Using the CLI directly.** The CLI is installed too, if you prefer the command line:
 
-```bash
-sudo apt install -y locales && sudo locale-gen en_US.UTF-8
-python3 -m venv .venv-cli
-.venv-cli/bin/pip install -r gui/requirements-cli.txt
-.venv-cli/bin/pip install --no-deps .
-python3 -m venv gui/.venv
-gui/.venv/bin/pip install -r gui/requirements-gui.txt
+```bat
+.venv-cli\Scripts\pan-os-upgrade.exe --help
+```
+
+**Installing by hand** (only if you can't use the setup), in Command Prompt in the project folder:
+
+```bat
+py -3 -m venv .venv-cli
+.venv-cli\Scripts\python.exe -m pip install -r gui\requirements-cli.txt
+.venv-cli\Scripts\python.exe -m pip install --no-deps .
+py -3 -m venv gui\.venv
+gui\.venv\Scripts\python.exe -m pip install -r gui\requirements-gui.txt
 ```
 
 Install the CLI from `requirements-cli.txt`. A plain `pip install .` pulls a newer `click` that
 breaks every CLI command.
-
-## Why not directly on Windows
-
-The GUI's pages load on Windows itself, but upgrades depend on Linux features:
-
-- **The password prompt hangs.** The GUI hands the password to the CLI through standard input, but
-  on Windows Python's hidden password prompt reads from the keyboard instead.
-- **Live upgrades can't start.** The confirmation dialog uses the Linux `ps` command, which
-  doesn't exist on Windows.
-- **The Stop button doesn't work.** It uses process signals that Windows doesn't have.
-
-Use WSL2 as described in this guide.

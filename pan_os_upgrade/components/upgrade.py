@@ -1,4 +1,4 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer; files are read and written as UTF-8 so they work on Windows.
 import json
 import logging
 import sys
@@ -927,7 +927,7 @@ def upgrade_firewall(
 
         # Load settings if the file exists
         if settings_file_path.exists():
-            with open(settings_file_path, "r") as file:
+            with open(settings_file_path, "r", encoding="utf-8") as file:
                 settings = yaml.safe_load(file)
 
             # Check if snapshots are disabled in the settings
@@ -978,7 +978,7 @@ def upgrade_firewall(
         json_report = f'{folder_path}/{time.strftime("%Y-%m-%d_%H-%M-%S")}_report.json'
 
         # Write the file to the local filesystem as JSON
-        with open(json_report, "w") as file:
+        with open(json_report, "w", encoding="utf-8") as file:
             file.write(json.dumps(pre_post_diff))
 
         logging.debug(

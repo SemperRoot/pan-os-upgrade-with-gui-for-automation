@@ -1,3 +1,4 @@
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows.
 """
 upgrade.py: Automating the Upgrade Process for Palo Alto Networks Devices with PDF Reporting
 
@@ -779,7 +780,7 @@ def batch(
 
     # Check if inventory.yaml exists and if it does, read the selected devices
     elif INVENTORY_FILE_PATH.exists():
-        with open(INVENTORY_FILE_PATH, "r") as file:
+        with open(INVENTORY_FILE_PATH, "r", encoding="utf-8") as file:
             inventory_data = yaml.safe_load(file)
             user_selected_hostnames = inventory_data.get("firewalls_to_upgrade", [])
 
@@ -1122,7 +1123,7 @@ def backup(
             if inventory:
                 user_selected_hostnames = inventory.split(",")
             elif INVENTORY_FILE_PATH.exists():
-                with open(INVENTORY_FILE_PATH, "r") as file:
+                with open(INVENTORY_FILE_PATH, "r", encoding="utf-8") as file:
                     user_selected_hostnames = (yaml.safe_load(file) or {}).get("firewalls_to_upgrade", [])
             elif non_interactive:
                 user_selected_hostnames = []
@@ -1340,11 +1341,11 @@ def inventory(
     # Keep other sections, such as management_addresses for direct backups
     inventory_data = {}
     if INVENTORY_FILE_PATH.exists():
-        with open(INVENTORY_FILE_PATH, "r") as file:
+        with open(INVENTORY_FILE_PATH, "r", encoding="utf-8") as file:
             inventory_data = yaml.safe_load(file) or {}
     inventory_data["firewalls_to_upgrade"] = [hostname for hostname in user_selected_hostnames]
 
-    with open("inventory.yaml", "w") as file:
+    with open("inventory.yaml", "w", encoding="utf-8") as file:
         yaml.dump(
             inventory_data,
             file,
@@ -1506,7 +1507,7 @@ def settings():
                 default=snapshot_info["enabled_by_default"],
             )
 
-    with open(config_file_path, "w") as f:
+    with open(config_file_path, "w", encoding="utf-8") as f:
         yaml.dump(
             config_data,
             f,

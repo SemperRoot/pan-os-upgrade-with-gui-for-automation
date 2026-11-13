@@ -1,5 +1,6 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the PDF diff report handles comparisons that return no results.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the PDF diff report handles comparisons that return no results; readiness checks fall back to another English locale when en_US.UTF-8 isn't available (Windows, minimal Linux); files are read and written as UTF-8 so they work on Windows.
 import importlib.resources as pkg_resources
+import locale
 import logging
 import sys
 import time
@@ -25,6 +26,23 @@ from pan_os_upgrade.components.utilities import (
     ensure_directory_exists,
     get_emoji,
 )
+
+
+# Locales tried, in order, before readiness checks so the firewall's English date strings parse.
+# panos-upgrade-assurance forces "en_US.UTF-8" itself, which Windows and minimal Linux installs often
+# don't accept ("unsupported locale setting"). "C" always exists and also uses English names.
+ENGLISH_LOCALES = ("en_US.UTF-8", "C.UTF-8", "en-US.UTF-8", "English_United States.utf8", "en-US", "C")
+
+
+def create_check_firewall(proxy_firewall: FirewallProxy) -> CheckFirewall:
+    """Create a CheckFirewall after setting the first English locale available on this system."""
+    for name in ENGLISH_LOCALES:
+        try:
+            locale.setlocale(locale.LC_ALL, name)
+            break
+        except locale.Error:
+            continue
+    return CheckFirewall(proxy_firewall, skip_force_locale=True)
 
 
 # Define panos-upgrade-assurance options
@@ -241,7 +259,7 @@ def get_checks_list(settings_file_path: Path) -> List[str | dict]:
     """
     # Load settings if the file exists
     if settings_file_path.exists():
-        with open(settings_file_path, "r") as file:
+        with open(settings_file_path, "r", encoding="utf-8") as file:
             settings = yaml.safe_load(file)
 
         # Check if readiness checks are disabled in the settings
@@ -597,7 +615,7 @@ def perform_readiness_checks(
 
         ensure_directory_exists(file_path=file_path)
 
-        with open(file_path, "w") as file:
+        with open(file_path, "w", encoding="utf-8") as file:
             file.write(readiness_check_report_json)
 
         logging.debug(
@@ -675,7 +693,7 @@ def perform_snapshot(
 
     # Load settings if the file exists
     if settings_file_path.exists():
-        with open(settings_file_path, "r") as file:
+        with open(settings_file_path, "r", encoding="utf-8") as file:
             settings = yaml.safe_load(file)
 
         # Check if snapshots are disabled in the settings
@@ -719,7 +737,7 @@ def perform_snapshot(
 
                 # Save the snapshot to the specified file path as JSON
                 ensure_directory_exists(file_path=file_path)
-                with open(file_path, "w") as file:
+                with open(file_path, "w", encoding="utf-8") as file:
                     file.write(snapshot.model_dump_json(indent=4))
 
                 logging.info(
@@ -805,7 +823,7 @@ def run_assurance(
 
     # setup Firewall client
     proxy_firewall = FirewallProxy(firewall)
-    checks_firewall = CheckFirewall(proxy_firewall)
+    checks_firewall = create_check_firewall(proxy_firewall)
 
     results = None
 

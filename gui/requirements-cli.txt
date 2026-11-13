@@ -1,5 +1,7 @@
 # Exact package versions for the pan-os-upgrade CLI, taken from the working macOS setup (Python 3.14).
-# Install with:  pip install -r gui/requirements-cli.txt  &&  pip install --no-deps .
+# All have pre-built wheels for Windows and Linux (x86_64, glibc 2.28+) on Python 3.11 to 3.13.
+# Normally installed by gui/install.py (see gui/INSTALL.md). By hand:
+#     pip install -r gui/requirements-cli.txt  &&  pip install --no-deps .
 # click must stay on 8.1.x: newer click breaks typer 0.9.4.
 annotated-types==0.8.0
 cffi==2.1.1

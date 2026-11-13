@@ -1,3 +1,4 @@
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows.
 import ipaddress
 import logging
 import os
@@ -113,7 +114,7 @@ def backup_configuration(
         ensure_directory_exists(file_path=file_path)
 
         # Write the file to the local filesystem
-        with open(file_path, "w") as file:
+        with open(file_path, "w", encoding="utf-8") as file:
             file.write(config_str)
 
         logging.debug(

@@ -250,7 +250,7 @@ def load_management_addresses(inventory_path: Path) -> Dict[str, str]:
     """
     if not inventory_path.exists():
         return {}
-    with open(inventory_path, "r") as file:
+    with open(inventory_path, "r", encoding="utf-8") as file:
         addresses = (yaml.safe_load(file) or {}).get("management_addresses") or {}
     return {str(name): str(address) for name, address in addresses.items()}
 
