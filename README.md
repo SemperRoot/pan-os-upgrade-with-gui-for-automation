@@ -7,6 +7,10 @@
 > [Apache License 2.0](LICENSE). All credit for the upgrade CLI goes to the original project and
 > its contributors.
 >
+>
+> **Current release: 1.3.11+gui.2026.11.23.** See [`gui/WHATS_NEW.md`](gui/WHATS_NEW.md) for what changed,
+> and [`gui/UPGRADING.md`](gui/UPGRADING.md) to update an existing installation.
+>
 > **What this fork adds**
 >
 > - **[`gui/`](gui/): the PAN-OS Upgrade Console**, a local web GUI that runs the CLI. See
@@ -17,10 +21,22 @@
 > **Changes to the original CLI** (compared with the 1.3.11 release; each file carries a notice):
 >
 > - `pan_os_upgrade/components/assurance.py`: the PDF diff report handles comparisons that return no results;
->   readiness checks fall back to another English locale when `en_US.UTF-8` isn't available (Windows, minimal Linux).
-> - `pan_os_upgrade/components/upgrade.py`: the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer.
+>   readiness checks fall back to another English locale when `en_US.UTF-8` isn't available (Windows, minimal Linux);
+>   snapshot retries count every failed attempt and stop after `snapshots.max_tries` (a snapshot that returned no data
+>   used to retry forever); disabling readiness checks no longer crashes.
+> - `pan_os_upgrade/components/upgrade.py`: the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer;
+>   downloads retry `download.max_tries` times and stop when the device's download job fails or after `download.timeout`
+>   (they used to wait forever); a failed pre-upgrade snapshot stops the device before changes, and a failed post-upgrade
+>   snapshot skips the comparison; HA members the run suspended are made functional again; Panorama no longer reboots
+>   after a failed install.
+> - `pan_os_upgrade/components/ha.py`: the active member is only suspended once its upgraded peer is passive; a peer
+>   that isn't reporting defers the device to round 2; round 2 stops with a clear reason instead of deferring again;
+>   failed suspensions stop the upgrade; dry runs never suspend HA.
+> - `pan_os_upgrade/main.py`: one device stopping no longer ends a batch run, so round 2 always runs; the run exits
+>   with code 1 if any device stopped; `pan-os-upgrade settings` asks for a download timeout.
 > - All files the CLI reads and writes use UTF-8 explicitly, so they work on Windows (`main.py`,
 >   `components/assurance.py`, `backup.py`, `upgrade.py`, `utilities.py`).
+> - `pyproject.toml`: the version is `1.3.11+gui.<release date>`, so an installation shows which fork release it runs.
 > - `requirements.txt` now points to the runtime packages in `gui/requirements-cli.txt` instead of an old
 >   development toolset that couldn't install on Python 3.12+.
 >

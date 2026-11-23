@@ -1,4 +1,4 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the PDF diff report handles comparisons that return no results; readiness checks fall back to another English locale when en_US.UTF-8 isn't available (Windows, minimal Linux); files are read and written as UTF-8 so they work on Windows.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the PDF diff report handles comparisons that return no results; readiness checks fall back to another English locale when en_US.UTF-8 isn't available (Windows, minimal Linux); files are read and written as UTF-8 so they work on Windows; snapshot retries count every failed attempt (a snapshot that returned no data used to retry forever) and stop after snapshots.max_tries; disabling readiness checks in settings no longer crashes (undefined hostname).
 import importlib.resources as pkg_resources
 import locale
 import logging
@@ -265,10 +265,10 @@ def get_checks_list(settings_file_path: Path) -> List[str | dict]:
         # Check if readiness checks are disabled in the settings
         if settings.get("readiness_checks", {}).get("disabled", False):
             logging.info(
-                f"{get_emoji(action='skipped')} {hostname}: Readiness checks are disabled in the settings. Skipping readiness checks for {hostname}."
+                f"{get_emoji(action='skipped')} Readiness checks are disabled in the settings. Skipping readiness checks."
             )
-            # Early return, no readiness checks performed
-            return
+            # Early return, no readiness checks performed (callers loop over the result)
+            return []
         # Determine readiness checks to perform based on settings
         if settings.get("readiness_checks", {}).get("customize", False):
             configured_checks = settings.get("readiness_checks", {}).get("checks", {})
@@ -627,6 +627,15 @@ def perform_readiness_checks(
         )
 
 
+def snapshots_disabled(settings_file_path: Path) -> bool:
+    """True if settings.yaml turns snapshots off (snapshots: disabled: true)."""
+    if settings_file_path is None or not settings_file_path.exists():
+        return False
+    with open(settings_file_path, "r", encoding="utf-8") as file:
+        settings = yaml.safe_load(file) or {}
+    return bool((settings.get("snapshots") or {}).get("disabled", False))
+
+
 def perform_snapshot(
     file_path: str,
     firewall: Firewall,
@@ -713,15 +722,13 @@ def perform_snapshot(
     logging.info(
         f"{get_emoji(action='start')} {hostname}: Performing snapshot of network state information."
     )
-    attempt = 0
-    snapshot = None
+    max_retries = max(1, int(max_retries))
 
-    while attempt < max_retries and snapshot is None:
+    for attempt in range(1, max_retries + 1):
+        logging.info(
+            f"{get_emoji(action='start')} {hostname}: Attempting to capture network state snapshot (Attempt {attempt} of {max_retries})."
+        )
         try:
-            logging.info(
-                f"{get_emoji(action='start')} {hostname}: Attempting to capture network state snapshot (Attempt {attempt + 1} of {max_retries})."
-            )
-
             # Take snapshots
             snapshot = run_assurance(
                 actions=actions,
@@ -730,9 +737,9 @@ def perform_snapshot(
                 operation_type="state_snapshot",
             )
 
-            if snapshot is not None and isinstance(snapshot, SnapshotReport):
+            if isinstance(snapshot, SnapshotReport):
                 logging.info(
-                    f"{get_emoji(action='success')} {hostname}: Network snapshot created successfully on attempt {attempt + 1}."
+                    f"{get_emoji(action='success')} {hostname}: Network snapshot created successfully on attempt {attempt}."
                 )
 
                 # Save the snapshot to the specified file path as JSON
@@ -746,18 +753,27 @@ def perform_snapshot(
 
                 return snapshot
 
+            reason = "no snapshot data was returned"
         # Catch specific and general exceptions
-        except (AttributeError, IOError, Exception) as error:
+        except Exception as error:
+            reason = f"error: {error}"
+
+        # Every failed attempt counts, whether run_assurance raised or returned nothing. (The
+        # original loop only counted exceptions, so a None result retried forever with no pause.)
+        if attempt < max_retries:
             logging.warning(
-                f"{get_emoji(action='warning')} {hostname}: Snapshot attempt failed with error: {error}. Retrying after {retry_interval} seconds."
+                f"{get_emoji(action='warning')} {hostname}: Snapshot attempt {attempt} of {max_retries} failed ({reason}). Retrying after {retry_interval} seconds."
             )
             time.sleep(retry_interval)
-            attempt += 1
+        else:
+            logging.warning(
+                f"{get_emoji(action='warning')} {hostname}: Snapshot attempt {attempt} of {max_retries} failed ({reason})."
+            )
 
-    if snapshot is None:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Failed to create snapshot after {max_retries} attempts."
-        )
+    logging.error(
+        f"{get_emoji(action='error')} {hostname}: Failed to create snapshot after {max_retries} attempts."
+    )
+    return None
 
 
 def run_assurance(

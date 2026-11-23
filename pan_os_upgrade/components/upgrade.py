@@ -1,4 +1,4 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer; files are read and written as UTF-8 so they work on Windows.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): the HA compatibility check allows direct upgrades to 11.x or later from 10.2 or newer; files are read and written as UTF-8 so they work on Windows; downloads use download.max_tries/retry_interval and stop after download.timeout or when the device's download job fails (a failed download used to wait forever); a failed pre-upgrade snapshot stops the device before changes and a failed post-upgrade snapshot skips the comparison instead of crashing; HA members this run suspended are made functional again after the reboot or when the upgrade stops; Panorama no longer reboots after a failed install.
 import json
 import logging
 import sys
@@ -30,6 +30,7 @@ from pan_os_upgrade.components.assurance import (
     perform_readiness_checks,
     perform_snapshot,
     get_checks_list,
+    snapshots_disabled,
 )
 from pan_os_upgrade.components.device import (
     check_panorama_license,
@@ -41,6 +42,7 @@ from pan_os_upgrade.components.ha import (
     ha_sync_check_panorama,
     handle_firewall_ha,
     handle_panorama_ha,
+    restore_ha_functional,
 )
 from pan_os_upgrade.components.utilities import (
     backup_configuration,
@@ -376,91 +378,186 @@ def software_download(
     - The retry logic and intervals for monitoring the download progress can be customized in the `settings.yaml` file if `settings_file_path` is utilized within the function, allowing for tailored behavior based on specific operational environments.
     """
 
-    if target_device.software.versions[target_version]["downloaded"]:
+    if target_device.software.versions[target_version]["downloaded"] is True:
         logging.info(
             f"{get_emoji(action='success')} {hostname}: version {target_version} already on target device."
         )
         return True
 
-    if (
-        not target_device.software.versions[target_version]["downloaded"]
-        or target_device.software.versions[target_version]["downloaded"]
-        != "downloading"
-    ):
-        logging.info(
-            f"{get_emoji(action='search')} {hostname}: version {target_version} is not on the target device"
-        )
+    logging.info(
+        f"{get_emoji(action='search')} {hostname}: version {target_version} is not on the target device"
+    )
 
-        start_time = time.time()
+    max_tries, retry_interval, timeout = download_settings(settings_file_path)
 
-        try:
-            selected_checks = get_checks_list(settings_file_path=settings_file_path)
-            if any(
-                check == "free_disk_space"
-                or (isinstance(check, dict) and "free_disk_space" in check)
-                for check in selected_checks
-            ):
-                # Check if there is enough space for the image
-                logging.info(
-                    f"{get_emoji(action='start')} {hostname}: Performing pre-upgrade disk space check"
-                )
-
-                perform_readiness_checks(
-                    file_path=f'assurance/readiness_checks/{hostname}/pre/disk_space_{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
-                    firewall=target_device,
-                    hostname=hostname,
-                    checks=["free_disk_space"],
-                )
+    try:
+        selected_checks = get_checks_list(settings_file_path=settings_file_path)
+        if any(
+            check == "free_disk_space"
+            or (isinstance(check, dict) and "free_disk_space" in check)
+            for check in selected_checks
+        ):
+            # Check if there is enough space for the image
             logging.info(
-                f"{get_emoji(action='start')} {hostname}: version {target_version} is beginning download"
-            )
-            target_device.software.download(target_version)
-        except PanDeviceXapiError as download_error:
-            logging.error(
-                f"{get_emoji(action='error')} {hostname}: Download Error {download_error}"
+                f"{get_emoji(action='start')} {hostname}: Performing pre-upgrade disk space check"
             )
 
-            sys.exit(1)
-
-        while True:
-            target_device.software.info()
-            dl_status = target_device.software.versions[target_version]["downloaded"]
-            elapsed_time = int(time.time() - start_time)
-
-            if dl_status is True:
-                logging.info(
-                    f"{get_emoji(action='success')} {hostname}: {target_version} downloaded in {elapsed_time} seconds",
-                )
-                return True
-            elif dl_status in (False, "downloading"):
-                # Consolidate logging for both 'False' and 'downloading' states
-                status_msg = (
-                    "Download is starting"
-                    if dl_status is False
-                    else f"Downloading version {target_version}"
-                )
-                if ha_details:
-                    logging.info(
-                        f"{get_emoji(action='working')} {hostname}: Downloading version {target_version} - HA will sync image - Elapsed time: {elapsed_time} seconds"
-                    )
-                else:
-                    logging.info(
-                        f"{get_emoji(action='working')} {hostname}: {status_msg} - Elapsed time: {elapsed_time} seconds"
-                    )
-            else:
-                logging.error(
-                    f"{get_emoji(action='error')} {hostname}: Download failed after {elapsed_time} seconds"
-                )
-                return False
-
-            time.sleep(30)
-
-    else:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Error downloading {target_version}."
+            perform_readiness_checks(
+                file_path=f'assurance/readiness_checks/{hostname}/pre/disk_space_{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
+                firewall=target_device,
+                hostname=hostname,
+                checks=["free_disk_space"],
+            )
+    except PanDeviceXapiError as check_error:
+        logging.warning(
+            f"{get_emoji(action='warning')} {hostname}: Disk space check didn't run: {check_error}"
         )
 
-        sys.exit(1)
+    for attempt in range(1, max_tries + 1):
+        if attempt > 1:
+            # A download already in progress rejects a new request; it may have finished since
+            try:
+                target_device.software.info()
+                if target_device.software.versions.get(target_version, {}).get("downloaded") is True:
+                    logging.info(
+                        f"{get_emoji(action='success')} {hostname}: version {target_version} already on target device."
+                    )
+                    return True
+            except (PanDeviceXapiError, PanDeviceError):
+                pass
+        logging.info(
+            f"{get_emoji(action='start')} {hostname}: version {target_version} is beginning download (attempt {attempt} of {max_tries})"
+        )
+        downloaded, reason = download_and_wait(
+            target_device=target_device,
+            hostname=hostname,
+            target_version=target_version,
+            ha_details=ha_details,
+            timeout=timeout,
+        )
+        if downloaded:
+            return True
+
+        if attempt < max_tries:
+            logging.warning(
+                f"{get_emoji(action='warning')} {hostname}: Download attempt {attempt} of {max_tries} failed: {reason} Retrying in {retry_interval} seconds."
+            )
+            time.sleep(retry_interval)
+        else:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Download failed after {max_tries} attempts: {reason} "
+                "If the device is short of disk space, delete old images "
+                "(delete software version <version>) and run it again."
+            )
+    return False
+
+
+def download_settings(settings_file_path: Path) -> tuple:
+    """download.max_tries, download.retry_interval and download.timeout (seconds per attempt) from settings.yaml."""
+    max_tries, retry_interval, timeout = 3, 60, 3600
+    if settings_file_path is not None and settings_file_path.exists():
+        with open(settings_file_path, "r", encoding="utf-8") as file:
+            download = (yaml.safe_load(file) or {}).get("download") or {}
+        max_tries = download.get("max_tries") or max_tries
+        retry_interval = download.get("retry_interval", retry_interval)
+        timeout = download.get("timeout") or timeout
+    return max(1, int(max_tries)), max(0, int(retry_interval)), max(60, int(timeout))
+
+
+def download_job_status(target_device: Union[Firewall, Panorama], job_id: str) -> tuple:
+    """(status, result, details) of a device job, e.g. ("FIN", "FAIL", "Not enough disk space")."""
+    response = target_device.op(f'show jobs id "{job_id}"')
+    job = response.find("./result/job")
+    if job is None:
+        return None, None, ""
+    details_element = job.find("details")
+    details = (
+        " ".join(text.strip() for text in details_element.itertext() if text.strip())
+        if details_element is not None
+        else ""
+    )
+    return job.findtext("status"), job.findtext("result"), details
+
+
+def download_and_wait(
+    target_device: Union[Firewall, Panorama],
+    hostname: str,
+    target_version: str,
+    ha_details: dict,
+    timeout: int,
+    poll_interval: int = 30,
+) -> tuple:
+    """
+    Start one download of target_version and wait for it, at most timeout seconds.
+
+    Returns (True, "") once the device lists the image as downloaded, or (False, reason) if the
+    download job fails (no disk space, for example), the request is rejected, or time runs out.
+    pan-os-python's download() doesn't return the job ID, so this sends the same request itself and
+    watches the job; before, a failed download left the image "not downloaded" and the wait looped forever.
+    """
+    start_time = time.time()
+    # Same command and log line as pan-os-python's software.download()
+    logging.info(f"Device {target_device.id} downloading version: {target_version}")
+    try:
+        response = target_device.op(
+            f'request system software download sync-to-peer "yes" version "{target_version}"'
+        )
+    except (PanDeviceXapiError, PanDeviceError) as download_error:
+        return False, f"the device rejected the download: {download_error}."
+    job = response.find("./result/job") if response is not None else None
+    job_id = job.text.strip() if job is not None and job.text else None
+
+    while True:
+        elapsed_time = int(time.time() - start_time)
+        dl_status = None
+        job_status = job_result = None
+        job_details = ""
+        try:
+            target_device.software.info()
+            dl_status = target_device.software.versions.get(target_version, {}).get("downloaded")
+            if job_id:
+                job_status, job_result, job_details = download_job_status(target_device, job_id)
+        except (PanDeviceXapiError, PanDeviceError) as poll_error:
+            logging.warning(
+                f"{get_emoji(action='warning')} {hostname}: Couldn't check the download status: {poll_error}"
+            )
+
+        if dl_status is True:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: {target_version} downloaded in {elapsed_time} seconds",
+            )
+            return True, ""
+
+        if job_status == "FIN":
+            if job_result == "OK":
+                # The job finished; the software list can lag a moment behind it
+                time.sleep(5)
+                try:
+                    target_device.software.info()
+                    if target_device.software.versions.get(target_version, {}).get("downloaded") is True:
+                        logging.info(
+                            f"{get_emoji(action='success')} {hostname}: {target_version} downloaded in {elapsed_time} seconds",
+                        )
+                        return True, ""
+                except (PanDeviceXapiError, PanDeviceError):
+                    pass
+                return False, f"the download job finished but {target_version} isn't listed as downloaded."
+            return False, f"the download job failed: {job_details or job_result}."
+
+        if elapsed_time >= timeout:
+            return False, (
+                f"the download didn't finish within {timeout} seconds (download.timeout in settings.yaml)."
+            )
+
+        if ha_details:
+            logging.info(
+                f"{get_emoji(action='working')} {hostname}: Downloading version {target_version} - HA will sync image - Elapsed time: {elapsed_time} seconds"
+            )
+        else:
+            logging.info(
+                f"{get_emoji(action='working')} {hostname}: Downloading version {target_version} - Elapsed time: {elapsed_time} seconds"
+            )
+        time.sleep(poll_interval)
 
 
 def software_update_check(
@@ -748,247 +845,279 @@ def upgrade_firewall(
         )
         sys.exit(1)
 
-    # If firewall is part of HA pair, determine if it's active or passive
-    if ha_details:
-        proceed_with_upgrade, peer_firewall = handle_firewall_ha(
-            dry_run=dry_run,
-            hostname=hostname,
-            settings_file=settings_file,
-            settings_file_path=settings_file_path,
-            target_device=firewall,
-            target_devices_to_revisit=target_devices_to_revisit,
-            target_devices_to_revisit_lock=target_devices_to_revisit_lock,
-        )
+    # From here on this run may suspend the device's HA state. If the upgrade stops for any reason,
+    # make it functional again so the pair isn't left with a suspended member.
+    try:
+        # If firewall is part of HA pair, determine if it's active or passive
+        if ha_details:
+            proceed_with_upgrade, peer_firewall = handle_firewall_ha(
+                dry_run=dry_run,
+                hostname=hostname,
+                settings_file=settings_file,
+                settings_file_path=settings_file_path,
+                target_device=firewall,
+                target_devices_to_revisit=target_devices_to_revisit,
+                target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+            )
 
-        # gracefully exit the upgrade_firewall function if the firewall is not ready for an upgrade to target version
-        if not proceed_with_upgrade:
-            if peer_firewall:
-                logging.info(
-                    f"{get_emoji(action='start')} {hostname}: Switching control to the peer firewall for upgrade."
+            # Exit without upgrading: an active member waiting for round 2
+            if not proceed_with_upgrade:
+                return
+
+        # Download the target version
+        logging.info(
+            f"{get_emoji(action='start')} {hostname}: Performing test to see if {target_version} is already downloaded."
+        )
+        image_downloaded = software_download(
+            firewall,
+            hostname,
+            target_version,
+            ha_details,
+            settings_file_path,
+        )
+        if not image_downloaded:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Image not downloaded, exiting."
+            )
+
+            sys.exit(1)
+
+        if deploy_info == "active" or deploy_info == "passive":
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: {target_version} has been downloaded and sync'd to HA peer."
+            )
+        else:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: version {target_version} has been downloaded."
+            )
+
+        # Determine snapshot actions to perform based on settings.yaml
+        if settings_file_path.exists() and settings_file.get("snapshots.customize", False):
+            # Extract state actions where value is True from settings.yaml
+            selected_actions = [
+                (
+                    action
+                    if isinstance(details, bool) or details == {"enabled": True}
+                    else (
+                        {action: convert_to_dict(details["params"])}
+                        if details.get("params")
+                        else action
+                    )
                 )
-                upgrade_firewall(peer_firewall, target_version, dry_run)
-            else:
-                return  # Exit the function without proceeding to upgrade
-
-    # Download the target version
-    logging.info(
-        f"{get_emoji(action='start')} {hostname}: Performing test to see if {target_version} is already downloaded."
-    )
-    image_downloaded = software_download(
-        firewall,
-        hostname,
-        target_version,
-        ha_details,
-        settings_file_path,
-    )
-    if deploy_info == "active" or deploy_info == "passive":
-        logging.info(
-            f"{get_emoji(action='success')} {hostname}: {target_version} has been downloaded and sync'd to HA peer."
-        )
-    else:
-        logging.info(
-            f"{get_emoji(action='success')} {hostname}: version {target_version} has been downloaded."
-        )
-
-    # Begin snapshots of the network state
-    if not image_downloaded:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Image not downloaded, exiting."
-        )
-
-        sys.exit(1)
-
-    # Determine snapshot actions to perform based on settings.yaml
-    if settings_file_path.exists() and settings_file.get("snapshots.customize", False):
-        # Extract state actions where value is True from settings.yaml
-        selected_actions = [
-            (
+                for action, details in settings_file.get("snapshots.state", {}).items()
+                if details is True
+                or (isinstance(details, dict) and details.get("enabled") is True)
+            ]
+        else:
+            # Select actions based on 'enabled_by_default' attribute from AssuranceOptions class
+            selected_actions = [
                 action
-                if isinstance(details, bool) or details == {"enabled": True}
-                else (
-                    {action: convert_to_dict(details["params"])}
-                    if details.get("params")
-                    else action
+                for action, attrs in AssuranceOptions.STATE_SNAPSHOTS.items()
+                if attrs.get("enabled_by_default", False)
+            ]
+
+        # Create a list from selected_actions so that it can be safely passed to `perform_snapshot`
+        selected_actions_list = [
+            action if isinstance(action, str) else list(action.keys())[0]
+            for action in selected_actions
+        ]
+
+        # Perform the pre-upgrade snapshot
+        pre_snapshot = perform_snapshot(
+            actions=selected_actions_list,
+            file_path=f'assurance/snapshots/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
+            firewall=firewall,
+            hostname=hostname,
+            settings_file_path=settings_file_path,
+        )
+
+        # Without a pre-upgrade snapshot there's nothing to compare after the upgrade. Stop now, before
+        # anything changes on the device, so it can simply be run again.
+        if pre_snapshot is None and not snapshots_disabled(settings_file_path):
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Snapshot failed: couldn't capture the pre-upgrade network state snapshot, so the upgrade stops before making changes. "
+                "Run it again, or set snapshots: disabled: true in settings.yaml to upgrade without snapshots."
+            )
+            sys.exit(1)
+
+        # Eliminate HA and Free Disk Space checks since they are area specific
+        selected_checks = [
+            check
+            for check in get_checks_list(settings_file_path=settings_file_path)
+            if not (
+                check in ["ha", "free_disk_space"]
+                or (
+                    isinstance(check, dict)
+                    and any(key in ["ha", "free_disk_space"] for key in check)
                 )
             )
-            for action, details in settings_file.get("snapshots.state", {}).items()
-            if details is True
-            or (isinstance(details, dict) and details.get("enabled") is True)
-        ]
-    else:
-        # Select actions based on 'enabled_by_default' attribute from AssuranceOptions class
-        selected_actions = [
-            action
-            for action, attrs in AssuranceOptions.STATE_SNAPSHOTS.items()
-            if attrs.get("enabled_by_default", False)
         ]
 
-    # Create a list from selected_actions so that it can be safely passed to `perform_snapshot`
-    selected_actions_list = [
-        action if isinstance(action, str) else list(action.keys())[0]
-        for action in selected_actions
-    ]
+        # Perform Readiness Checks
+        perform_readiness_checks(
+            file_path=f'assurance/readiness_checks/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
+            firewall=firewall,
+            hostname=hostname,
+            checks=selected_checks,
+        )
 
-    # Perform the pre-upgrade snapshot
-    pre_snapshot = perform_snapshot(
-        actions=selected_actions_list,
-        file_path=f'assurance/snapshots/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
-        firewall=firewall,
-        hostname=hostname,
-        settings_file_path=settings_file_path,
-    )
-
-    # Eliminate HA and Free Disk Space checks since they are area specific
-    selected_checks = [
-        check
-        for check in get_checks_list(settings_file_path=settings_file_path)
-        if not (
-            check in ["ha", "free_disk_space"]
-            or (
-                isinstance(check, dict)
-                and any(key in ["ha", "free_disk_space"] for key in check)
+        # Perform HA sync check, skipping standalone firewalls
+        if ha_details:
+            ha_sync_check_firewall(
+                ha_details=ha_details,
+                hostname=hostname,
             )
-        )
-    ]
-
-    # Perform Readiness Checks
-    perform_readiness_checks(
-        file_path=f'assurance/readiness_checks/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
-        firewall=firewall,
-        hostname=hostname,
-        checks=selected_checks,
-    )
-
-    # Perform HA sync check, skipping standalone firewalls
-    if ha_details:
-        ha_sync_check_firewall(
-            ha_details=ha_details,
-            hostname=hostname,
-        )
-
-    # Back up configuration to local filesystem
-    logging.info(
-        f"{get_emoji(action='start')} {hostname}: Performing backup of configuration to local filesystem."
-    )
-    backup_config = backup_configuration(
-        file_path=f'assurance/configurations/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
-        hostname=hostname,
-        target_device=firewall,
-    )
-    logging.debug(f"{get_emoji(action='report')} {hostname}: {backup_config}")
-
-    # Exit execution is dry_run is True
-    if dry_run is True:
-        logging.info(
-            f"{get_emoji(action='success')} {hostname}: Dry run complete, exiting."
-        )
-        logging.info(f"{get_emoji(action='stop')} {hostname}: Halting script.")
-        sys.exit(0)
-    else:
-        logging.info(
-            f"{get_emoji(action='report')} {hostname}: Not a dry run, continue with upgrade."
-        )
-
-    # Perform the upgrade
-    install_success = perform_upgrade(
-        hostname=hostname,
-        settings_file=settings_file,
-        settings_file_path=settings_file_path,
-        target_device=firewall,
-        target_version=target_version,
-    )
-
-    # Perform the reboot if the installation was successful
-    if install_success:
-        perform_reboot(
-            hostname=hostname,
-            settings_file=settings_file,
-            settings_file_path=settings_file_path,
-            target_device=firewall,
-            target_version=target_version,
-        )
 
         # Back up configuration to local filesystem
         logging.info(
             f"{get_emoji(action='start')} {hostname}: Performing backup of configuration to local filesystem."
         )
         backup_config = backup_configuration(
-            file_path=f'assurance/configurations/{hostname}/post/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
+            file_path=f'assurance/configurations/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
             hostname=hostname,
             target_device=firewall,
         )
         logging.debug(f"{get_emoji(action='report')} {hostname}: {backup_config}")
 
-        # Wait for the device to become ready for the post upgrade snapshot
-        logging.info(
-            f"{get_emoji(action='working')} {hostname}: Waiting for the device to become ready for the post upgrade snapshot."
-        )
-        time.sleep(120)
+        # Exit execution is dry_run is True
+        if dry_run is True:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: Dry run complete, exiting."
+            )
+            logging.info(f"{get_emoji(action='stop')} {hostname}: Halting script.")
+            sys.exit(0)
+        else:
+            logging.info(
+                f"{get_emoji(action='report')} {hostname}: Not a dry run, continue with upgrade."
+            )
 
-        # Load settings if the file exists
-        if settings_file_path.exists():
-            with open(settings_file_path, "r", encoding="utf-8") as file:
-                settings = yaml.safe_load(file)
-
-            # Check if snapshots are disabled in the settings
-            if settings.get("snapshots", {}).get("disabled", False):
-                logging.info(
-                    f"{get_emoji(action='skipped')} {hostname}: Snapshots are disabled in the settings. Skipping snapshot for {hostname}."
-                )
-                # Early return, no snapshot performed
-                return None
-
-        # Perform the post-upgrade snapshot
-        post_snapshot = perform_snapshot(
-            actions=selected_actions_list,
-            file_path=f'assurance/snapshots/{hostname}/post/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
-            firewall=firewall,
+        # Perform the upgrade
+        install_success = perform_upgrade(
             hostname=hostname,
+            settings_file=settings_file,
             settings_file_path=settings_file_path,
-        )
-
-        # initialize object storing both snapshots
-        snapshot_compare = SnapshotCompare(
-            left_snapshot=pre_snapshot.model_dump(),
-            right_snapshot=post_snapshot.model_dump(),
-        )
-
-        pre_post_diff = snapshot_compare.compare_snapshots(selected_actions)
-
-        logging.debug(
-            f"{get_emoji(action='report')} {hostname}: Snapshot comparison before and after upgrade {pre_post_diff}"
-        )
-
-        folder_path = f"assurance/snapshots/{hostname}/diff"
-        pdf_report = f'{folder_path}/{time.strftime("%Y-%m-%d_%H-%M-%S")}_report.pdf'
-        ensure_directory_exists(file_path=pdf_report)
-
-        # Generate the PDF report for the diff
-        generate_diff_report_pdf(
-            file_path=pdf_report,
-            hostname=hostname,
-            pre_post_diff=pre_post_diff,
+            target_device=firewall,
             target_version=target_version,
         )
 
-        logging.info(
-            f"{get_emoji(action='save')} {hostname}: Snapshot comparison PDF report saved to {pdf_report}"
+        # Perform the reboot if the installation was successful
+        if install_success:
+            perform_reboot(
+                hostname=hostname,
+                settings_file=settings_file,
+                settings_file_path=settings_file_path,
+                target_device=firewall,
+                target_version=target_version,
+            )
+
+            # Rejoin the HA pair: suspended HA survives the reboot
+            restore_ha_functional(
+                target_device=firewall,
+                hostname=hostname,
+                settings_file=settings_file,
+                settings_file_path=settings_file_path,
+            )
+
+            # Back up configuration to local filesystem
+            logging.info(
+                f"{get_emoji(action='start')} {hostname}: Performing backup of configuration to local filesystem."
+            )
+            backup_config = backup_configuration(
+                file_path=f'assurance/configurations/{hostname}/post/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
+                hostname=hostname,
+                target_device=firewall,
+            )
+            logging.debug(f"{get_emoji(action='report')} {hostname}: {backup_config}")
+
+            # Wait for the device to become ready for the post upgrade snapshot
+            logging.info(
+                f"{get_emoji(action='working')} {hostname}: Waiting for the device to become ready for the post upgrade snapshot."
+            )
+            time.sleep(120)
+
+            # Load settings if the file exists
+            if settings_file_path.exists():
+                with open(settings_file_path, "r", encoding="utf-8") as file:
+                    settings = yaml.safe_load(file)
+
+                # Check if snapshots are disabled in the settings
+                if settings.get("snapshots", {}).get("disabled", False):
+                    logging.info(
+                        f"{get_emoji(action='skipped')} {hostname}: Snapshots are disabled in the settings. Skipping snapshot for {hostname}."
+                    )
+                    # Early return, no snapshot performed
+                    return None
+
+            # Perform the post-upgrade snapshot
+            post_snapshot = perform_snapshot(
+                actions=selected_actions_list,
+                file_path=f'assurance/snapshots/{hostname}/post/{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
+                firewall=firewall,
+                hostname=hostname,
+                settings_file_path=settings_file_path,
+            )
+
+            if pre_snapshot is None or post_snapshot is None:
+                logging.warning(
+                    f"{get_emoji(action='warning')} {hostname}: Skipping the snapshot comparison because the post-upgrade snapshot couldn't be captured. The upgrade itself completed."
+                )
+                logging.info(
+                    f"{get_emoji(action='success')} {hostname}: Upgrade completed without a snapshot comparison."
+                )
+                return None
+
+            # initialize object storing both snapshots
+            snapshot_compare = SnapshotCompare(
+                left_snapshot=pre_snapshot.model_dump(),
+                right_snapshot=post_snapshot.model_dump(),
+            )
+
+            pre_post_diff = snapshot_compare.compare_snapshots(selected_actions)
+
+            logging.debug(
+                f"{get_emoji(action='report')} {hostname}: Snapshot comparison before and after upgrade {pre_post_diff}"
+            )
+
+            folder_path = f"assurance/snapshots/{hostname}/diff"
+            pdf_report = f'{folder_path}/{time.strftime("%Y-%m-%d_%H-%M-%S")}_report.pdf'
+            ensure_directory_exists(file_path=pdf_report)
+
+            # Generate the PDF report for the diff
+            generate_diff_report_pdf(
+                file_path=pdf_report,
+                hostname=hostname,
+                pre_post_diff=pre_post_diff,
+                target_version=target_version,
+            )
+
+            logging.info(
+                f"{get_emoji(action='save')} {hostname}: Snapshot comparison PDF report saved to {pdf_report}"
+            )
+
+            json_report = f'{folder_path}/{time.strftime("%Y-%m-%d_%H-%M-%S")}_report.json'
+
+            # Write the file to the local filesystem as JSON
+            with open(json_report, "w", encoding="utf-8") as file:
+                file.write(json.dumps(pre_post_diff))
+
+            logging.debug(
+                f"{get_emoji(action='save')} {hostname}: Snapshot comparison JSON report saved to {json_report}"
+            )
+
+        else:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Installation of the target version was not successful. Skipping reboot."
+            )
+            # Fail the device (and restore HA below) rather than ending as if it succeeded
+            sys.exit(1)
+    except (Exception, SystemExit):
+        restore_ha_functional(
+            target_device=firewall,
+            hostname=hostname,
+            settings_file=settings_file,
+            settings_file_path=settings_file_path,
         )
-
-        json_report = f'{folder_path}/{time.strftime("%Y-%m-%d_%H-%M-%S")}_report.json'
-
-        # Write the file to the local filesystem as JSON
-        with open(json_report, "w", encoding="utf-8") as file:
-            file.write(json.dumps(pre_post_diff))
-
-        logging.debug(
-            f"{get_emoji(action='save')} {hostname}: Snapshot comparison JSON report saved to {json_report}"
-        )
-
-    else:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Installation of the target version was not successful. Skipping reboot."
-        )
+        raise
 
 
 def upgrade_panorama(
@@ -1077,138 +1206,151 @@ def upgrade_panorama(
     logging.info(f"{get_emoji(action='report')} {hostname}: HA mode: {deploy_info}")
     logging.debug(f"{get_emoji(action='report')} {hostname}: HA details: {ha_details}")
 
-    # If Panorama is part of HA pair, determine if it's active or passive
-    if ha_details:
-        proceed_with_upgrade, peer_panorama = handle_panorama_ha(
-            dry_run=dry_run,
+    # From here on this run may suspend the device's HA state. If the upgrade stops for any reason,
+    # make it functional again so the pair isn't left with a suspended member.
+    try:
+        # If Panorama is part of HA pair, determine if it's active or passive
+        if ha_details:
+            proceed_with_upgrade, peer_panorama = handle_panorama_ha(
+                dry_run=dry_run,
+                hostname=hostname,
+                settings_file=settings_file,
+                settings_file_path=settings_file_path,
+                target_device=panorama,
+                target_devices_to_revisit=target_devices_to_revisit,
+                target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+            )
+
+            # Exit without upgrading: an active member waiting for round 2
+            if not proceed_with_upgrade:
+                return
+
+        # Check to see if the Panorama is ready for an upgrade
+        logging.debug(
+            f"{get_emoji(action='start')} {hostname}: Performing tests to validate Panorama's readiness."
+        )
+        update_available = software_update_check(
+            ha_details=ha_details,
             hostname=hostname,
             settings_file=settings_file,
             settings_file_path=settings_file_path,
             target_device=panorama,
-            target_devices_to_revisit=target_devices_to_revisit,
-            target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+            target_version=target_version,
         )
 
-        if not proceed_with_upgrade:
-            if peer_panorama:
-                logging.info(
-                    f"{get_emoji(action='start')} {hostname}: Switching control to the peer Panorama for upgrade."
-                )
-                upgrade_panorama(
-                    dry_run=dry_run,
-                    panorama=peer_panorama,
-                    target_version=target_version,
-                )
-            else:
-                # Exit the function without proceeding to upgrade
-                return
+        # gracefully exit if the Panorama is not ready for an upgrade to target version
+        if not update_available:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Not ready for upgrade to {target_version}.",
+            )
+            sys.exit(1)
 
-    # Check to see if the Panorama is ready for an upgrade
-    logging.debug(
-        f"{get_emoji(action='start')} {hostname}: Performing tests to validate Panorama's readiness."
-    )
-    update_available = software_update_check(
-        ha_details=ha_details,
-        hostname=hostname,
-        settings_file=settings_file,
-        settings_file_path=settings_file_path,
-        target_device=panorama,
-        target_version=target_version,
-    )
-
-    # gracefully exit if the Panorama is not ready for an upgrade to target version
-    if not update_available:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Not ready for upgrade to {target_version}.",
-        )
-        sys.exit(1)
-
-    # Download the target version
-    logging.info(
-        f"{get_emoji(action='start')} {hostname}: Performing test to see if {target_version} is already downloaded."
-    )
-    image_downloaded = software_download(
-        panorama,
-        hostname,
-        target_version,
-        ha_details,
-        settings_file_path,
-    )
-    if deploy_info == "primary-active" or deploy_info == "secondary-passive":
+        # Download the target version
         logging.info(
-            f"{get_emoji(action='success')} {hostname}: {target_version} has been downloaded and sync'd to HA peer."
+            f"{get_emoji(action='start')} {hostname}: Performing test to see if {target_version} is already downloaded."
         )
-    else:
+        image_downloaded = software_download(
+            panorama,
+            hostname,
+            target_version,
+            ha_details,
+            settings_file_path,
+        )
+        if not image_downloaded:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Image not downloaded, exiting."
+            )
+
+            sys.exit(1)
+
+        if deploy_info == "primary-active" or deploy_info == "secondary-passive":
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: {target_version} has been downloaded and sync'd to HA peer."
+            )
+        else:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: Panorama version {target_version} has been downloaded."
+            )
+
+        # Determine strictness of HA sync check
+        with target_devices_to_revisit_lock:
+            is_panorama_to_revisit = panorama in target_devices_to_revisit
+
+        # Print out list of Panorama appliances to revisit
+        logging.debug(
+            f"{get_emoji(action='report')} Panorama appliances to revisit: {target_devices_to_revisit}"
+        )
+        logging.debug(
+            f"{get_emoji(action='report')} {hostname}: Is Panorama to revisit: {is_panorama_to_revisit}"
+        )
+
+        # Perform HA sync check, skipping standalone Panoramas
+        if ha_details:
+            ha_sync_check_panorama(
+                ha_details=ha_details,
+                hostname=hostname,
+                strict_sync_check=False,
+                # strict_sync_check=not is_panorama_to_revisit,
+            )
+
+        # Back up configuration to local filesystem
         logging.info(
-            f"{get_emoji(action='success')} {hostname}: Panorama version {target_version} has been downloaded."
+            f"{get_emoji(action='start')} {hostname}: Performing backup of configuration to local filesystem."
         )
-
-    # Begin snapshots of the network state
-    if not image_downloaded:
-        logging.error(
-            f"{get_emoji(action='error')} {hostname}: Image not downloaded, exiting."
-        )
-
-        sys.exit(1)
-
-    # Determine strictness of HA sync check
-    with target_devices_to_revisit_lock:
-        is_panorama_to_revisit = panorama in target_devices_to_revisit
-
-    # Print out list of Panorama appliances to revisit
-    logging.debug(
-        f"{get_emoji(action='report')} Panorama appliances to revisit: {target_devices_to_revisit}"
-    )
-    logging.debug(
-        f"{get_emoji(action='report')} {hostname}: Is Panorama to revisit: {is_panorama_to_revisit}"
-    )
-
-    # Perform HA sync check, skipping standalone Panoramas
-    if ha_details:
-        ha_sync_check_panorama(
-            ha_details=ha_details,
+        backup_config = backup_configuration(
+            file_path=f'assurance/configurations/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
             hostname=hostname,
-            strict_sync_check=False,
-            # strict_sync_check=not is_panorama_to_revisit,
+            target_device=panorama,
+        )
+        logging.debug(f"{get_emoji(action='report')} {hostname}: {backup_config}")
+
+        # Exit execution is dry_run is True
+        if dry_run is True:
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: Dry run complete, exiting."
+            )
+            logging.info(f"{get_emoji(action='stop')} {hostname}: Halting script.")
+            sys.exit(0)
+        else:
+            logging.info(
+                f"{get_emoji(action='start')} {hostname}: Not a dry run, continue with upgrade."
+            )
+
+        # Perform the upgrade
+        install_success = perform_upgrade(
+            hostname=hostname,
+            settings_file=settings_file,
+            settings_file_path=settings_file_path,
+            target_device=panorama,
+            target_version=target_version,
+        )
+        if not install_success:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: Installation of the target version was not successful. Skipping reboot."
+            )
+            sys.exit(1)
+
+        # Perform the reboot
+        perform_reboot(
+            hostname=hostname,
+            settings_file=settings_file,
+            settings_file_path=settings_file_path,
+            target_device=panorama,
+            target_version=target_version,
         )
 
-    # Back up configuration to local filesystem
-    logging.info(
-        f"{get_emoji(action='start')} {hostname}: Performing backup of configuration to local filesystem."
-    )
-    backup_config = backup_configuration(
-        file_path=f'assurance/configurations/{hostname}/pre/{time.strftime("%Y-%m-%d_%H-%M-%S")}.xml',
-        hostname=hostname,
-        target_device=panorama,
-    )
-    logging.debug(f"{get_emoji(action='report')} {hostname}: {backup_config}")
-
-    # Exit execution is dry_run is True
-    if dry_run is True:
-        logging.info(
-            f"{get_emoji(action='success')} {hostname}: Dry run complete, exiting."
+        # Rejoin the HA pair: suspended HA survives the reboot
+        restore_ha_functional(
+            target_device=panorama,
+            hostname=hostname,
+            settings_file=settings_file,
+            settings_file_path=settings_file_path,
         )
-        logging.info(f"{get_emoji(action='stop')} {hostname}: Halting script.")
-        sys.exit(0)
-    else:
-        logging.info(
-            f"{get_emoji(action='start')} {hostname}: Not a dry run, continue with upgrade."
+    except (Exception, SystemExit):
+        restore_ha_functional(
+            target_device=panorama,
+            hostname=hostname,
+            settings_file=settings_file,
+            settings_file_path=settings_file_path,
         )
-
-    # Perform the upgrade
-    perform_upgrade(
-        hostname=hostname,
-        settings_file=settings_file,
-        settings_file_path=settings_file_path,
-        target_device=panorama,
-        target_version=target_version,
-    )
-
-    # Perform the reboot
-    perform_reboot(
-        hostname=hostname,
-        settings_file=settings_file,
-        settings_file_path=settings_file_path,
-        target_device=panorama,
-        target_version=target_version,
-    )
+        raise

@@ -539,6 +539,7 @@ Would you like to disable all snapshots? [y/N]:
 Number of concurrent threads [10]:
 PAN-OS download retry interval (seconds) [60]:
 PAN-OS maximum download tries [3]:
+PAN-OS download timeout per try (seconds) [3600]:
 PAN-OS install retry interval (seconds) [60]:
 PAN-OS maximum install attempts [3]:
 Logging level [INFO]:
@@ -588,6 +589,7 @@ concurrency:
 download:
   max_tries: 3
   retry_interval: 60
+  timeout: 3600
 install:
   max_tries: 3
   retry_interval: 60

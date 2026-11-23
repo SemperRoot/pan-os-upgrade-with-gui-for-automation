@@ -2,6 +2,21 @@
 
 Welcome to the release notes for the `pan-os-upgrade` tool. This document provides a detailed record of changes, enhancements, and fixes in each version of the tool.
 
+## Fork release 1.3.11+gui.2026.11.23
+
+**Release Date:** *<20261123>*
+
+Release of the fork that adds the PAN-OS Upgrade Console GUI. See
+[gui/WHATS_NEW.md](https://github.com/SemperRoot/pan-os-upgrade-with-gui-for-automation/blob/main/gui/WHATS_NEW.md)
+for details and `gui/UPGRADING.md` to update an existing installation.
+
+- Batch runs: one device stopping no longer ends the run, so round 2 (HA active members) always runs
+- HA members the run suspended are made functional again after their upgrade, or when it stops
+- The active member is only suspended once its upgraded peer is passive; inventory order no longer matters
+- Downloads stop when the device's download job fails or after `download.timeout`, and honor `download.max_tries`
+- Snapshot retries stop after `snapshots.max_tries`, even when a snapshot returns no data
+- GUI: retry the devices that need attention, export results as CSV, version check, new retry settings
+
 ## Version 1.3.10
 
 **Release Date:** *<20240319>*

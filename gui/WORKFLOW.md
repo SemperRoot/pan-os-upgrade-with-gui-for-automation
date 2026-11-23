@@ -65,6 +65,8 @@ Open **Configuration → Settings**. The defaults suit most upgrades. Look at:
 | **Readiness checks** | Run before each upgrade. Checks marked **Blocks upgrade** stop that device if they fail. Turn on **Customize readiness checks** to choose. Keep `ha` on for HA pairs. |
 | **Snapshots** | Captured before and after; the comparison is how you verify the upgrade. Consider enabling `ip_sec_tunnels` if the firewalls carry VPNs. |
 | **Retry policy → Reboot** | How long the CLI waits for a device to come back. Default: 30 tries × 60 s. Raise it for slow platforms. |
+| **Retry policy → Download, Snapshots, HA sync** | The per-device error limits. A device is marked failed after this many download or snapshot attempts instead of retrying forever, and the rest of the run carries on. HA sync sets round 2's wait for the peer and the attempts to make a suspended member functional again. Defaults: 3 tries × 60 s. |
+| **Download timeout per try** | A download that hasn't finished in this time counts as a failed try. Default: 3600 s. Raise it for slow links to the update server. |
 | **Concurrent threads** | How many devices a batch upgrade runs at once. |
 
 Click **Save settings**. The **Unsaved changes** badge disappears once saved.
@@ -150,14 +152,16 @@ When the status badge shows **Completed**:
 - **Read the Output panel** (or the run on **Monitoring → Run history**). Look for errors,
   failed readiness checks and *Not ready for upgrade*.
 - **Check the HA lines.** You should see the active member deferred (*Added target device to
-  revisit list*) and the passive member go through the checks.
+  revisit list*), the passive member go through the checks, then the active member's checks in
+  round 2. A dry run never suspends HA.
 - **Open the readiness results** in `gui/workspace/assurance/readiness_checks/<host>/pre/`.
 - **Fix whatever failed** (pending changes, expired licenses, disk space, HA state) and run the
   dry run again until it's clean.
 
 **Completed** means the CLI exited with code 0. It doesn't mean every check passed: checks
-without **Blocks upgrade** only log an error, and a device that's already on the target version
-also ends the run with code 0. Read the output.
+without **Blocks upgrade** only log an error. Read the output. **Failed (exit 1)** after a batch run
+means at least one device stopped (including a device that's already on the target version); the
+other devices still ran. The Upgrade tracker shows which devices need attention and why.
 
 ## Step 4: Live upgrade
 
@@ -165,7 +169,7 @@ also ends the run with code 0. Read the output.
 2. In the **Execution** panel, select **Live upgrade**. The panel turns red and the button changes
    to **Start live upgrade**.
 3. Click **Start live upgrade**. A confirmation dialog shows the target devices and version, warns
-   about reboots, and reminds you that HA isn't restored automatically. If other `pan-os-upgrade`
+   about reboots, and summarizes how HA members are suspended and restored. If other `pan-os-upgrade`
    processes are running on this machine, it lists them.
 4. **Type the target version** in the dialog. **Start live upgrade** is enabled only when it
    matches exactly.
@@ -181,8 +185,9 @@ What happens next depends on the page:
 | Batch, without a device list | Pick devices in the Output panel, click **Done**, then confirm with **Yes**. |
 
 For an HA pair with the same version on both members, the order is: the passive member is
-suspended and upgraded first; after HA syncs, the active member is suspended, traffic fails over
-to the upgraded member, and the original active member is upgraded.
+suspended, upgraded, and made functional again; once it's back as passive, the active member is
+suspended, traffic fails over to the upgraded member, and the original active member is upgraded
+and made functional again. The order of devices in the list doesn't matter.
 
 ## Step 5: Monitor
 
@@ -203,6 +208,8 @@ to the upgraded member, and the original active member is upgraded.
   | *Revisiting firewalls that were active in an HA pair* | Round 2 started |
   | *Waiting for HA synchronization to complete* | Round 2 sync wait, at least 60 s |
   | *Suspending HA state of active or active-primary* | Failover to the upgraded member |
+  | *HA state restored to functional* | A member rejoined the pair after its upgrade |
+  | *HA peer not ready* / *HA peer not upgraded* | Round 2 stopped an active member without suspending it |
 
 - **Copy icon** next to **Stop**: copies the path of this run's saved output file.
 - You can close the browser tab; the run continues. Reopen <http://localhost:8080> to check on it.
@@ -213,12 +220,14 @@ to the upgraded member, and the original active member is upgraded.
 **Stop** sends an interrupt, then forces the CLI to exit if it doesn't stop within 10 seconds. On
 Windows, which has no interrupt signal for a background process, it ends the CLI immediately.
 **Avoid stopping during download, install or reboot.** A download or install already running on
-a device keeps going there, but the CLI won't reboot it, and an HA member may be left suspended.
+a device keeps going there, but the CLI won't reboot it, and an HA member may be left suspended
+(the CLI only restores HA itself when a device's upgrade ends or fails, not when the whole run is stopped).
 After stopping, check each device's software state and HA state by hand.
 
 ## Step 6: Verify
 
-The CLI suspends HA on each member and **never sets it back to functional**. After every live run:
+The CLI suspends HA on each member for its upgrade and makes it functional again afterwards. The
+Upgrade tracker's HA suspended banner lists any member it couldn't restore. After every live run:
 
 1. **Check HA state on both members:**
 
@@ -226,7 +235,7 @@ The CLI suspends HA on each member and **never sets it back to functional**. Aft
    show high-availability state
    ```
 
-2. **Return any suspended member to service**, from that member's CLI:
+2. **Return any member still suspended to service**, from that member's CLI:
 
    ```
    request high-availability state functional
@@ -241,17 +250,23 @@ The CLI suspends HA on each member and **never sets it back to functional**. Aft
    entries, sessions, interfaces and IPsec tunnels. The CLI doesn't judge these differences; a
    person has to read them.
 7. **Keep the run record.** **Run history** has the full output, and the configuration backups
-   are in `gui/workspace/assurance/configurations/<host>/`.
+   are in `gui/workspace/assurance/configurations/<host>/`. **Export results** on the Upgrade tracker
+   saves a per-device summary as CSV for Excel.
+8. **Retry what's left.** If devices need attention, fix the cause and click **Retry devices that
+   need attention** on the Upgrade tracker: it fills the Batch upgrade form with just those devices.
 
 ## When something goes wrong
 
 | Symptom | Where to look and what to do |
 |---------|------------------------------|
 | **Failed (exit 1)** early in the run | Output panel. Usually *Not ready for upgrade*: the version isn't available, the jump is blocked for HA, or a check marked **Blocks upgrade** failed. Fix it and dry-run again. |
-| *No upgrade required or downgrade attempt detected* | The device already runs the target version or newer. Nothing was changed on it, but this also **ends the run after round 1** (see next row). |
-| Passive members upgraded, active members never started | A device stopped in round 1 (already on target, not ready, failed blocking check), which cancels round 2 for every pair. Check HA state and restore suspended members, fix or remove that device, then run again: each pair's members are now on different versions, so they'll upgrade together (see [Peers on different versions](README.md#peers-on-different-versions)). Consider upgrading each remaining active member on its own from the **Firewall** page. |
+| *No upgrade required or downgrade attempt detected* | The device already runs the target version or newer. Nothing was changed on it. The other devices carry on. |
+| *Download failed after N attempts* | The device couldn't download the image. The message includes the device's reason, for example *Not enough disk space*. Free space (`delete software version <old version>`), then use **Retry devices that need attention**. |
+| *Snapshot failed* | The pre-upgrade snapshot couldn't be captured after **Retry policy → Snapshots** attempts, so the device stopped before anything changed. Check that the device's API responds, then retry it, or disable snapshots to upgrade without a comparison. |
+| *HA peer not upgraded* (round 2) | The active member's peer is still on the old version: its upgrade failed or it wasn't in the device list. Nothing changed on the active member. Fix the peer first, then retry both. |
+| *HA peer not ready* (round 2) | The upgraded peer isn't passive (for example still suspended), so the active member wasn't suspended. Check `show high-availability state` on the peer, make it functional, then retry the active member. |
+| *Failed to restore HA state to functional* | The member was upgraded (or stopped) but couldn't be made functional again. Run `request high-availability state functional` on it. The tracker's HA suspended banner lists it. |
 | Run stuck on **Awaiting input** | Read the orange prompt bar and reply. |
 | A device doesn't come back after reboot | The CLI keeps waiting until **Retry policy → Reboot** runs out. Check the device's console. Raise the reboot limit for slow platforms. |
-| Only one HA member was upgraded | Check whether the run was stopped, whether another device stopped round 1 (row above), whether the other member was in an unexpected HA state, or (batch) whether both members were listed. Check `show high-availability state` and restore suspended members. |
+| Only one HA member was upgraded | Check the other member's row in the Upgrade tracker for its reason: *HA peer not ready*, *HA peer not upgraded*, an unexpected HA state, or (batch) whether both members were listed. Check `show high-availability state` on both members. |
 | Need more detail | Set **Settings → Logging level** to `DEBUG`, save, and check **Monitoring → Logs** on the next run. |
-| A dry run suspended HA | Known CLI issue when the HA members run different versions (see [Known issues](README.md#known-issues)). Restore the member with `request high-availability state functional`. |

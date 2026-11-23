@@ -62,10 +62,40 @@ SETTINGS_PATH = WORKSPACE / "settings.yaml"
 INVENTORY_PATH = WORKSPACE / "inventory.yaml"
 CONSOLE_DIR = WORKSPACE / "console"
 BACKUPS_DIR = WORKSPACE / "assurance" / "backups"
+
+
+def project_version() -> str:
+    """Version of these project files, from pyproject.toml (e.g. 1.3.11+gui.2026.11.23)."""
+    match = re.search(r'^version\s*=\s*"([^"]+)"', (REPO_DIR / "pyproject.toml").read_text(encoding="utf-8"), re.M)
+    return match.group(1) if match else ""
+
+
+def installed_cli_version() -> str:
+    """Version of the CLI installed in the CLI's environment, or "" if it can't be found.
+
+    The installer copies the CLI into .venv-cli, so new project files only take effect for the
+    CLI after the setup runs again. Comparing the two catches an update that skipped that step.
+    """
+    venv = CLI_PYTHON.parent.parent
+    for pattern in ("Lib/site-packages/pan_os_upgrade-*.dist-info", "lib/python*/site-packages/pan_os_upgrade-*.dist-info"):
+        for dist_info in venv.glob(pattern):
+            try:
+                for line in (dist_info / "METADATA").read_text(encoding="utf-8").splitlines():
+                    if line.startswith("Version:"):
+                        return line.split(":", 1)[1].strip()
+            except OSError:
+                continue
+    return ""
+
+
+PROJECT_VERSION = project_version()
+CLI_VERSION = installed_cli_version()
+CLI_OUTDATED = bool(CLI_VERSION and PROJECT_VERSION and CLI_VERSION != PROJECT_VERSION)
 # A live batch upgrade warns about target firewalls without a backup this recent
 BACKUP_MAX_AGE = timedelta(hours=24)
 ASSURANCE_SOURCE = REPO_DIR / "pan_os_upgrade" / "components" / "assurance.py"
 GUIDE_PATH = GUI_DIR / "README.md"
+WHATS_NEW_PATH = GUI_DIR / "WHATS_NEW.md"
 
 # Log files that can be viewed (read-only) from the Logs page
 LOG_FILES = {
@@ -174,6 +204,7 @@ NAV = [
     ]),
     ("Help", [
         ("guide", "HA upgrade guide", "menu_book"),
+        ("whatsnew", "What's new", "new_releases"),
     ]),
 ]
 
@@ -701,9 +732,9 @@ async def confirm_real_upgrade(
                 "restart_alt",
             )
             notice(
-                "HA pairs: HA is suspended on each member and is not restored automatically. After the run, "
-                "check show high-availability state and run request high-availability state functional "
-                "on any member left suspended.",
+                "HA pairs: each member's HA is suspended for its upgrade and made functional again after its "
+                "reboot, or if its upgrade stops. The active member is only suspended once its upgraded peer is "
+                "passive. Check the Upgrade tracker for any member still listed as suspended.",
                 "warning",
                 "device_hub",
             )
@@ -747,9 +778,11 @@ def ha_guidance(first: str, second: str, navigate: Callable[[str], None], extra:
         "follows after HA sync, failing over to the upgraded member.",
         "**Different versions:** both members upgrade **at the same time**, so the pair can go fully down. "
         "Align the versions first, or upgrade one member at a time.",
-        f"**Dry run** only exercises the {first} member. The other member is skipped.",
-        "**HA is not restored automatically.** After a live run, check `show high-availability state` and run "
-        "`request high-availability state functional` on any member left suspended.",
+        f"**Dry run** checks both members. The {second} member is checked in round 2.",
+        "**HA is restored automatically.** Each member suspended for its upgrade is made functional again "
+        "after its reboot, or if its upgrade stops. The active member is only suspended once its peer is "
+        "passive and can take over. If a member can't be restored, the Upgrade tracker lists it: run "
+        "`request high-availability state functional` on it.",
         *(extra or []),
     ]
     with card("HA pairs", "How this tool upgrades the members of an HA pair", icon="device_hub"):
@@ -759,11 +792,11 @@ def ha_guidance(first: str, second: str, navigate: Callable[[str], None], extra:
         ).classes("self-start")
 
 
-def guide_markdown() -> str:
+def guide_markdown(path: Path = GUIDE_PATH) -> str:
     try:
-        text = GUIDE_PATH.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except OSError:
-        return f"`{GUIDE_PATH}` not found."
+        return f"`{path}` not found."
     text = re.sub(r"\A# .*\n", "", text)  # the page header already shows the title
     # Links to repository files don't resolve in the browser; keep their text
     return re.sub(r"\[([^\]]+)\]\((?!#|https?:)[^)]+\)", r"\1", text)
@@ -896,9 +929,9 @@ def batch_page(navigate: Callable[[str], None]):
                 username, password = credential_inputs("batch")
         ha_guidance(
             "passive (or active-secondary)", "active (or active-primary)", navigate,
-            extra=["**List both members of every pair.** If only the active member of a same-version pair is "
-                   "listed, nothing is upgraded. If only the passive member is listed, the pair ends up on "
-                   "mismatched versions."],
+            extra=["**List both members of every pair, in any order.** If only the active member of a "
+                   "same-version pair is listed, it fails in round 2 with \"HA peer not upgraded\". If only the "
+                   "passive member is listed, the pair ends up on mismatched versions."],
         )
 
     def field_targets() -> list[str]:
@@ -1240,10 +1273,23 @@ def settings_page():
                     ui.label("")
                     ui.label("Interval").classes("app-overline")
                     ui.label("Max tries").classes("app-overline")
-                    for stage, interval, tries in (("Download", 60, 3), ("Install", 60, 3), ("Reboot", 60, 30)):
-                        ui.label(stage).classes("text-sm font-medium")
-                        number("Seconds", f"{stage.lower()}.retry_interval", interval, "s")
-                        number("Attempts", f"{stage.lower()}.max_tries", tries)
+                    for stage, prefix, interval, tries, hint in (
+                        ("Download", "download", 60, 3, "Download attempts per device before it fails."),
+                        ("Install", "install", 60, 3, "Install attempts while the software manager is busy."),
+                        ("Reboot", "reboot", 60, 30, "Checks for the device to come back after its reboot."),
+                        ("Snapshots", "snapshots", 60, 3, "Snapshot attempts before and after the upgrade."),
+                        ("HA sync", "ha_sync", 60, 3,
+                         "Round 2's wait for the HA peer, and attempts to make a suspended member functional again."),
+                    ):
+                        ui.label(stage).classes("text-sm font-medium").tooltip(hint)
+                        number("Seconds", f"{prefix}.retry_interval", interval, "s")
+                        number("Attempts", f"{prefix}.max_tries", tries)
+                with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-4 w-full items-center"):
+                    number("Download timeout per try", "download.timeout", 3600, "s")
+                    ui.label(
+                        "A download that hasn't finished in this time counts as a failed try. "
+                        "A failed download job (no disk space, for example) fails the try at once."
+                    ).classes("text-xs app-muted")
             with card("Logging", "CLI log output for GUI runs", icon="article"):
                 with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-4 w-full"):
                     log_level = ui.select(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], label="Logging level").props(
@@ -1326,15 +1372,19 @@ def settings_page():
         state["loaded"] = [element.value for element in watched]
 
     def save():
-        config = {}
+        # Start from the file so keys this page doesn't show (added by hand) survive a save
+        config = {k: (dict(v) if isinstance(v, dict) else v) for k, v in (read_settings() or {}).items()}
         for path, (element, _) in numbers.items():
             section, key = path.split(".")
-            config.setdefault(section, {})[key] = int(element.value or 1)
+            if not isinstance(config.get(section), dict):
+                config[section] = {}
+            config[section][key] = int(element.value or 1)
         config["logging"]["level"] = log_level.value
         config["logging"]["file_path"] = log_path.value or "logs/upgrade.log"
 
         no_checks = checks_disabled.value
         config["readiness_checks"] = {
+            **(config.get("readiness_checks") or {}),
             "disabled": no_checks,
             "customize": False if no_checks else checks_customize.value,
             "checks": {n: b.value for n, b in check_boxes.items()} if checks_customize.value and not no_checks else {},
@@ -1342,12 +1392,11 @@ def settings_page():
         }
         no_snaps = snaps_disabled.value
         config["snapshots"] = {
+            **(config.get("snapshots") or {}),
             "disabled": no_snaps,
             "customize": False if no_snaps else snaps_customize.value,
             "state": {n: b.value for n, b in snapshot_boxes.items()} if snaps_customize.value and not no_snaps else {},
             "location": None if no_snaps else "assurance/snapshots/",
-            "retry_interval": None if no_snaps else 60,
-            "max_tries": None if no_snaps else 3,
         }
 
         WORKSPACE.mkdir(parents=True, exist_ok=True)
@@ -1401,13 +1450,21 @@ def duration(since: Optional[datetime]) -> str:
     return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
 
 
-def tracker_page():
+def tracker_page(navigate: Callable[[str], None]):
     actions = page_header("Monitoring", "Upgrade tracker",
                           "Where each device is in an upgrade or backup run, read from the run's console output.",
                           "monitor_heart")
     with actions:
         source = ui.select({}, label="Run").props("outlined dense stack-label options-dense").classes("w-80")
         ui.button("Refresh", icon="refresh", on_click=lambda: refresh_sources()).props("flat no-caps")
+        export_button = ui.button("Export results", icon="download", on_click=lambda: export_results()).props(
+            "flat no-caps"
+        ).tooltip("Download one row per device (status, versions, problem) as a CSV file for Excel")
+        retry_button = ui.button(
+            "Retry devices that need attention", icon="replay", on_click=lambda: retry_attention()
+        ).props("flat no-caps").tooltip(
+            "Put the devices that failed or weren't upgraded into the Batch upgrade form, to run them again"
+        )
 
     with ui.row().classes("w-full items-center gap-3"):
         run_status = ui.chip("", icon="radio_button_unchecked").props("dense text-color=white")
@@ -1477,7 +1534,7 @@ def tracker_page():
               <span>{{ props.row.role }}</span>
               <q-badge v-if="props.row.round == 2" color="secondary" label="Round 2" class="q-ml-xs" />
               <q-icon v-if="props.row.ha_suspended" name="pause_circle" color="warning" size="xs" class="q-ml-xs">
-                <q-tooltip>HA suspended by this run. Not restored automatically.</q-tooltip>
+                <q-tooltip>HA suspended by this run and not made functional again yet.</q-tooltip>
               </q-icon>
             </q-td>""")
         table.add_slot("body-cell-status", r"""
@@ -1533,6 +1590,38 @@ def tracker_page():
             except OSError:
                 return None
         return None
+
+    def run_command() -> str:
+        if source.value == "current":
+            return runner.command
+        match = CONSOLE_FILE_NAME.match(source.value or "")
+        return match.group(5) if match else ""
+
+    def export_results():
+        tracker = current_tracker()
+        if not tracker or not tracker.devices:
+            ui.notify("This run has no devices to export.", type="warning")
+            return
+        match = CONSOLE_FILE_NAME.match(source.value or "")
+        started = "_".join(match.groups()[:4]) if match else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # The byte order mark makes Excel read the file as UTF-8
+        ui.download.content(
+            "\ufeff" + tracker.to_csv(), f"{run_command() or 'run'}-results-{started}.csv", "text/csv"
+        )
+
+    def retry_attention():
+        tracker = current_tracker()
+        hosts = tracker.needs_attention() if tracker else []
+        if not hosts:
+            ui.notify("No devices in this run need attention.", type="info")
+            return
+        app.storage.general["batch.inventory"] = ", ".join(hosts)
+        navigate("batch")
+        ui.notify(
+            f"Batch upgrade set to the {len(hosts)} device(s) that need attention. Fix what stopped them, "
+            "check the target version, then start a dry run or the upgrade.",
+            type="info", multi_line=True,
+        )
 
     def refresh_sources():
         options = {}
@@ -1629,10 +1718,15 @@ def tracker_page():
         suspended_note.set_visibility(bool(suspended))
         if suspended:
             suspended_note.text_label.text = (
-                f"HA was suspended on {len(suspended)} device(s) by this run: {', '.join(suspended)}. The CLI never "
-                "restores it. When the run is finished, check show high-availability state and run "
-                "request high-availability state functional on each member left suspended."
+                f"HA is suspended on {len(suspended)} device(s) by this run: {', '.join(suspended)}. Each one is "
+                "made functional again after its reboot, or when its upgrade stops. If the run has finished and a "
+                "device is still listed, check show high-availability state and run "
+                "request high-availability state functional on it."
             )
+
+        has_attention = bool(tracker and tracker.finished and tracker.needs_attention())
+        retry_button.set_visibility(has_attention and run_command() == "batch")
+        export_button.set_visibility(has_devices)
 
         # Only rebuild the table when something changed; durations tick every 5 seconds on a live run
         live_tick = int(datetime.now().timestamp() // 5) if is_current and runner.running else 0
@@ -1693,7 +1787,8 @@ def tracker_page():
                             ("Current version", device.current_version or ("unknown" if upgrade else "")),
                             ("Target version", device.target_version or ("unknown" if upgrade else "")),
                             ("Peer version", device.peer_version),
-                            ("HA suspended", ("Yes, restore it after the run" if device.ha_suspended else "No")
+                            ("HA peer state", device.peer_state),
+                            ("HA suspended", ("Yes, not made functional again yet" if device.ha_suspended else "No")
                              if upgrade else ""),
                             ("Serial", device.serial),
                             ("IP address", device.ip),
@@ -1834,6 +1929,15 @@ def guide_page():
     page_header("Help", "HA upgrade guide", f"How the CLI upgrades HA pairs. Source: {GUIDE_PATH}", "menu_book")
     with card():
         ui.markdown(guide_markdown(), extras=["fenced-code-blocks", "tables", "header-ids"]).classes(
+            "app-doc w-full max-w-4xl"
+        )
+
+
+def whats_new_page():
+    page_header("Help", "What's new", f"Changes in this release ({PROJECT_VERSION}). Source: {WHATS_NEW_PATH}",
+                "new_releases")
+    with card():
+        ui.markdown(guide_markdown(WHATS_NEW_PATH), extras=["fenced-code-blocks", "tables", "header-ids"]).classes(
             "app-doc w-full max-w-4xl"
         )
 
@@ -2015,6 +2119,11 @@ def index(page: Optional[str] = None):
                     )
                     ui.label("CLI available" if found else "CLI not found").classes("text-xs")
                 ui.label(str(CLI_PYTHON)).classes("text-[11px] app-muted app-mono break-all")
+                ui.label("Version").classes("text-xs mt-2")
+                ui.label(f"Project {PROJECT_VERSION or 'unknown'}").classes("text-[11px] app-muted app-mono break-all")
+                ui.label(f"CLI {CLI_VERSION or 'unknown'}").classes(
+                    "text-[11px] app-mono break-all " + ("text-negative" if CLI_OUTDATED else "app-muted")
+                )
                 ui.label("Workspace").classes("text-xs mt-2")
                 ui.label(str(WORKSPACE)).classes("text-[11px] app-muted app-mono break-all")
 
@@ -2034,6 +2143,14 @@ def index(page: Optional[str] = None):
         ).props("flat round dense").tooltip("Toggle dark mode")
 
     with ui.column().classes("w-full max-w-screen-2xl mx-auto px-6 py-6 gap-4"):
+        if CLI_OUTDATED:
+            notice(
+                f"The installed CLI ({CLI_VERSION}) is older than these project files ({PROJECT_VERSION}), so runs "
+                "use the old CLI. Stop the GUI and run the setup again (gui\\setup.cmd on Windows, "
+                "bash gui/setup-linux.sh on Linux) with the same options as the first install. See gui/UPGRADING.md.",
+                "negative",
+                "update",
+            )
         external = notice("", "warning", "warning")
 
         async def check_external():
@@ -2061,13 +2178,15 @@ def index(page: Optional[str] = None):
             with ui.tab_panel("settings"):
                 settings_page()
             with ui.tab_panel("tracker"):
-                tracker_page()
+                tracker_page(navigate)
             with ui.tab_panel("history"):
                 history_page()
             with ui.tab_panel("logs"):
                 logs_page()
             with ui.tab_panel("guide"):
                 guide_page()
+            with ui.tab_panel("whatsnew"):
+                whats_new_page()
 
     show_output = output_dock(navigate)
     header_status.on("click", show_output)
