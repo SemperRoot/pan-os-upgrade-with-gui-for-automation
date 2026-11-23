@@ -33,7 +33,10 @@
 >   that isn't reporting defers the device to round 2; round 2 stops with a clear reason instead of deferring again;
 >   failed suspensions stop the upgrade; dry runs never suspend HA.
 > - `pan_os_upgrade/main.py`: one device stopping no longer ends a batch run, so round 2 always runs; the run exits
->   with code 1 if any device stopped; `pan-os-upgrade settings` asks for a download timeout.
+>   with code 1 if any device stopped; `pan-os-upgrade settings` asks for a download timeout; error tracebacks no
+>   longer print local variables (they included the password); a Panorama with no connected firewalls stops with a
+>   clear message.
+> - `pan_os_upgrade/models/devices.py`: a Panorama with no connected devices returns an empty list instead of crashing.
 > - All files the CLI reads and writes use UTF-8 explicitly, so they work on Windows (`main.py`,
 >   `components/assurance.py`, `backup.py`, `upgrade.py`, `utilities.py`).
 > - `pyproject.toml`: the version is `1.3.11+gui.<release date>`, so an installation shows which fork release it runs.

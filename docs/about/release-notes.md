@@ -16,6 +16,8 @@ for details and `gui/UPGRADING.md` to update an existing installation.
 - Downloads stop when the device's download job fails or after `download.timeout`, and honor `download.max_tries`
 - Snapshot retries stop after `snapshots.max_tries`, even when a snapshot returns no data
 - GUI: retry the devices that need attention, export results as CSV, version check, new retry settings
+- Error tracebacks no longer print local variables, which included the password typed at the prompt
+- A Panorama with no connected firewalls stops with a clear message instead of crashing
 
 ## Version 1.3.10
 

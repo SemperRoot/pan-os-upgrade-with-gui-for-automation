@@ -1,4 +1,4 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows; a device thread that stops with sys.exit() no longer ends the whole batch, so round 2 (HA active members) runs; settings asks for a download timeout.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows; a device thread that stops with sys.exit() no longer ends the whole batch, so round 2 (HA active members) runs; settings asks for a download timeout; error tracebacks no longer print local variables (they included the password); a Panorama with no connected firewalls stops with a clear message.
 """
 upgrade.py: Automating the Upgrade Process for Palo Alto Networks Devices with PDF Reporting
 
@@ -121,7 +121,9 @@ from pan_os_upgrade.components.utilities import (
 
 
 # Define Typer command-line interface
-app = typer.Typer(help="PAN-OS Upgrade script")
+# pretty_exceptions_show_locals=False: Typer's default error display prints every local variable,
+# which includes the password typed at the prompt
+app = typer.Typer(help="PAN-OS Upgrade script", pretty_exceptions_show_locals=False)
 
 # Define the path to the settings file
 SETTINGS_FILE_PATH = Path.cwd() / "settings.yaml"
@@ -169,6 +171,16 @@ def wait_for_upgrades(future_to_device: dict, hostname: str, device_kind: str) -
             logging.error(
                 f"{get_emoji(action='error')} {hostname}: {device_kind} {name} generated an exception: {exc}"
             )
+
+
+def require_connected_firewalls(all_firewalls: list, hostname: str) -> None:
+    """Stop with a clear message when Panorama has no connected firewalls to work with."""
+    if not all_firewalls:
+        logging.error(
+            f"{get_emoji(action='error')} {hostname}: Panorama reports no connected firewalls "
+            "(show devices connected). Check that the firewalls are connected to this Panorama, then try again."
+        )
+        sys.exit(1)
 
 
 def exit_if_any_stopped(hostname: str) -> None:
@@ -771,6 +783,7 @@ def batch(
         f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
     )
     all_firewalls = get_firewalls_from_panorama(panorama=device)
+    require_connected_firewalls(all_firewalls, hostname)
 
     # Retrieve additional information about all of the firewalls
     logging.info(
@@ -1105,6 +1118,7 @@ def backup(
                 f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
             )
             all_firewalls = get_firewalls_from_panorama(panorama=device)
+            require_connected_firewalls(all_firewalls, hostname)
             logging.info(
                 f"{get_emoji(action='working')} {hostname}: Retrieving detailed information of each firewall..."
             )
@@ -1316,6 +1330,7 @@ def inventory(
         f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
     )
     all_firewalls = get_firewalls_from_panorama(panorama=device)
+    require_connected_firewalls(all_firewalls, hostname)
 
     # Retrieve additional information about all of the firewalls
     logging.info(

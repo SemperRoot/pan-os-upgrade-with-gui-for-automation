@@ -37,6 +37,12 @@ follow each Windows one.
    request high-availability state functional
    ```
 
+3. **Delete old error output that may contain passwords.** The previous version printed the
+   password typed at the prompt when it crashed with an error (a box titled *Traceback*). If that
+   happened, delete the saved output: in the GUI, the run under **Monitoring → Run history**, which
+   is a file in `gui\workspace\console\`. If you ran the CLI directly, also check any saved
+   terminal output or transcripts. Change any password that appeared there.
+
 ## 2. Get the new version
 
 Download the project ZIP for release 2026-11-23 from your internal Git server. On Windows, right-click

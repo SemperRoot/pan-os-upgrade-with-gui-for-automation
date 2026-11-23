@@ -76,8 +76,17 @@ upgrade tool.
 - If the **post-upgrade** snapshot can't be captured, the upgrade is still marked complete. Only the
   comparison report is skipped. Before, the run crashed at the comparison after a successful upgrade.
 
+**Security**
+
+- **Error output no longer shows passwords.** When the tool crashed, its error display printed
+  every local variable, including the password typed at the prompt. Error output now shows only
+  where the error happened. If an earlier version crashed on your machine, see
+  [UPGRADING.md](UPGRADING.md#1-before-you-start) for where that output may have been saved.
+
 **Other fixes**
 
+- A Panorama with no connected firewalls now stops with *Panorama reports no connected firewalls*,
+  instead of crashing with `'str' object has no attribute 'get'` (inventory, batch and backup).
 - Turning off all readiness checks in Settings no longer crashes every upgrade.
 - A firewall whose install fails is marked failed, and its HA is restored. Before, it could end as
   if it had succeeded, with HA still suspended.

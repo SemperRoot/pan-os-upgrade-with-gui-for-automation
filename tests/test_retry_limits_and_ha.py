@@ -356,3 +356,30 @@ def test_device_exit_does_not_end_the_batch(monkeypatch):
     assert main.stopped_devices == ["fw-fail"]
     with pytest.raises(SystemExit):
         main.exit_if_any_stopped("panorama")
+
+
+# ---------------------------------------------------------------- Panorama with no firewalls, secrets
+
+
+def test_panorama_with_no_connected_devices_returns_empty_list():
+    from pan_os_upgrade.models import ManagedDevices
+
+    response = {"result": {"devices": "Total Connected Devices: 0\n"}}
+    assert ManagedDevices.from_api_response(response).devices == []
+    one = {"result": {"devices": {"entry": {"hostname": "fw1", "serial": "1", "connected": "yes"}}}}
+    assert [d.hostname for d in ManagedDevices.from_api_response(one).devices] == ["fw1"]
+
+
+def test_no_connected_firewalls_stops_cleanly():
+    from pan_os_upgrade import main
+
+    with pytest.raises(SystemExit):
+        main.require_connected_firewalls([], "panorama")
+    main.require_connected_firewalls([MagicMock()], "panorama")
+
+
+def test_error_tracebacks_never_show_local_variables():
+    # Typer's default prints every local variable, including the password typed at the prompt
+    from pan_os_upgrade import main
+
+    assert main.app.pretty_exceptions_show_locals is False
