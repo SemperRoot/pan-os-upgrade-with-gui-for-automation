@@ -6,7 +6,7 @@ Run after gui/install.py, with the GUI's Python:
     Windows:  gui\\.venv\\Scripts\\python.exe gui\\smoke_test.py
     Linux:    gui/.venv/bin/python gui/smoke_test.py
 
-It checks that the CLI starts, that a password sent by the GUI reaches the CLI's hidden prompt
+It checks that the CLI starts and matches the project files' version, that a password sent by the GUI reaches the CLI's hidden prompt
 (the CLI then tries 192.0.2.1, a reserved documentation address that never answers, and is
 stopped), which English locale readiness checks will use, and that the GUI's web server starts.
 Prints PASS or FAIL for each check; the exit code is 0 only if everything passed.
@@ -48,6 +48,16 @@ def check_cli_starts():
     started = "firewall" in result.stdout
     report("CLI starts", started, "" if started else (result.stdout + result.stderr).strip()[-500:])
     return started
+
+
+def check_cli_version():
+    # The installer copies the CLI into .venv-cli; after replacing the project files the setup has to
+    # run again, or the old CLI keeps running
+    installed, project = gui.installed_cli_version(), gui.project_version()
+    current = bool(installed) and installed == project
+    report("CLI matches the project files", current,
+           f"version {installed}" if current else
+           f"installed CLI {installed or 'not found'}, project files {project}. Run the setup again.")
 
 
 def check_locale():
@@ -125,6 +135,7 @@ def check_gui_serves():
 def main():
     print(f"Python {sys.version.split()[0]} on {sys.platform}\nCLI:  {gui.CLI_PYTHON}\n", flush=True)
     if check_cli_starts():
+        check_cli_version()
         check_locale()
         asyncio.run(check_password_and_stop())
     check_gui_serves()

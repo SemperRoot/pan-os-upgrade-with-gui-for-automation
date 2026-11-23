@@ -173,3 +173,84 @@ def test_backup_run():
     assert fw_a.reports == ["assurance/backups/fw-a/ts/running-config.xml"]
     assert fw_b.status == "failed" and fw_b.stage == "Running config"
     assert fw_b.problem == "Configuration backup failed: timed out"
+
+
+def test_ha_restored_after_reboot_clears_suspended():
+    restored = """\
+🚀 fw-a: Restoring HA state to functional (this run suspended it).
+✅ fw-a: HA state restored to functional.
+"""
+    t = run(BATCH_HEADER + restored, finish=False)
+    assert not t.devices["fw-a"].ha_suspended
+    assert t.suspended() == []
+
+
+def test_round_two_peer_not_upgraded_fails_active():
+    log = BATCH_HEADER + """\
+🚀 panorama.example.com: Revisiting firewalls that were active in an HA pair and had the same version as their peers.
+📝 fw-b: Local state: active, Local version: 11.2.13, Peer version: 11.2.13
+📝 fw-b: HA peer state: passive
+📝 fw-b: Version comparison: equal
+❌ fw-b: HA peer not upgraded: the peer still runs 11.2.13, so it wasn't upgraded in round 1 (it failed, or it isn't in this run's inventory). Not upgrading this active firewall. Upgrade the peer first, then run this firewall again.
+❌ panorama.example.com: Firewall 000000000002 stopped (exit code 1).
+"""
+    t = run(log, exit_code=1)
+    fw_b = t.devices["fw-b"]
+    assert fw_b.status == "failed" and fw_b.problem.startswith("HA peer not upgraded")
+    assert fw_b.peer_state == "passive"
+    assert "fw-b" in t.needs_attention()
+
+
+def test_download_failure_keeps_the_reason():
+    log = BATCH_HEADER + """\
+🟧 fw-c: Download attempt 1 of 2 failed: the download job failed: Not enough disk space. Retrying in 60 seconds.
+❌ fw-c: Download failed after 2 attempts: the download job failed: Not enough disk space. If the device is short of disk space, delete old images (delete software version <version>) and run it again.
+❌ fw-c: Image not downloaded, exiting.
+"""
+    fw_c = run(log, exit_code=1).devices["fw-c"]
+    assert fw_c.status == "failed" and fw_c.stage == "Download"
+    assert "Not enough disk space" in fw_c.problem
+
+
+def test_snapshot_failure_and_stopped_line():
+    log = BATCH_HEADER + """\
+🟧 fw-c: Snapshot attempt 1 of 3 failed (no snapshot data was returned). Retrying after 60 seconds.
+❌ fw-c: Failed to create snapshot after 3 attempts.
+❌ fw-c: Snapshot failed: couldn't capture the pre-upgrade network state snapshot, so the upgrade stops before making changes. Run it again, or set snapshots: disabled: true in settings.yaml to upgrade without snapshots.
+❌ panorama.example.com: Firewall 000000000003 stopped (exit code 1).
+"""
+    fw_c = run(log, exit_code=1).devices["fw-c"]
+    assert fw_c.status == "failed" and fw_c.stage == "Snapshot"
+    assert fw_c.problem.startswith("Snapshot failed")
+
+
+def test_stopped_line_fails_a_device_that_did_not_say_why():
+    log = BATCH_HEADER + "❌ panorama.example.com: Firewall 000000000003 stopped (exit code 1).\n"
+    fw_c = run(log, finish=False).devices["fw-c"]
+    assert fw_c.status == "failed" and "exit code 1" in fw_c.problem
+
+
+def test_completed_without_snapshot_comparison():
+    log = BATCH_HEADER + PASSIVE_UPGRADE.replace(
+        "💾 fw-a: Snapshot comparison PDF report saved to assurance/snapshots/fw-a/diff/report.pdf\n",
+        "🟧 fw-a: Skipping the snapshot comparison because the post-upgrade snapshot couldn't be captured. "
+        "The upgrade itself completed.\n✅ fw-a: Upgrade completed without a snapshot comparison.\n",
+    )
+    assert run(log, finish=False).devices["fw-a"].status == "completed"
+
+
+def test_export_csv_and_attention_list():
+    failure = "❌ fw-a: Not ready for upgrade to 11.2.16-h1.\n"
+    t = run(BATCH_HEADER + failure, exit_code=1)
+    text = t.to_csv()
+    header, *rows = text.strip().split("\r\n")
+    assert header.startswith("Device,IP address,Serial,HA role")
+    assert len(rows) == 3
+    assert "Not ready for upgrade" in text
+    assert t.needs_attention() == ["fw-a", "fw-b", "fw-c"]
+
+
+def test_export_neutralizes_formula_cells():
+    t = run("❌ fw-x: Not ready for upgrade to =HYPERLINK(1).\n", finish=False)
+    t.devices["fw-x"].problem = "=cmd()"
+    assert ",'=cmd()," in t.to_csv()

@@ -19,7 +19,7 @@ for how HA pairs are upgraded.
 - [2. Install](#2-install)
 - [3. Check the installation](#3-check-the-installation)
 - [4. Start the GUI](#4-start-the-gui)
-- [Updating](#updating)
+- [Updating](#updating) (see also [UPGRADING.md](UPGRADING.md) and [WHATS_NEW.md](WHATS_NEW.md))
 - [Troubleshooting](#troubleshooting)
 - [What gets installed](#what-gets-installed)
 
@@ -142,7 +142,7 @@ gui\.venv\Scripts\python.exe gui\smoke_test.py
 gui/.venv/bin/python gui/smoke_test.py
 ```
 
-Every line should start with `PASS`. One check briefly tries to reach `192.0.2.1`, an address
+Every line should start with `PASS` (7 checks). One check briefly tries to reach `192.0.2.1`, an address
 reserved for documentation that never answers, to show that the password typed in the GUI reaches
 the CLI.
 
@@ -180,9 +180,17 @@ The CLI is installed too, if you prefer the command line:
 
 ## Updating
 
-Replace the project files with the new version (keep `gui/workspace`, which holds your settings,
-inventory, logs and backups), then run the same install command again. It reuses the existing
-environments and only installs what changed.
+Read [WHATS_NEW.md](WHATS_NEW.md) and [UPGRADING.md](UPGRADING.md) for the release you're installing.
+In short:
+
+1. Replace the project files with the new version. Keep `gui/workspace`, which holds your settings,
+   inventory, logs and backups (and any `settings.yaml` / `inventory.yaml` you use with the CLI directly).
+2. **Run the same install command again.** This step is required: the installer copies the CLI into
+   `.venv-cli`, so until it runs again the GUI and `pan-os-upgrade` keep running the old CLI. It
+   reuses the existing environments and only installs what changed.
+3. Run the [check](#3-check-the-installation). **CLI matches the project files** must say `PASS`.
+   The GUI's side menu also shows both versions under **Environment**, and a red warning at the top
+   of every page if the installed CLI is older than the project files.
 
 ## Troubleshooting
 
@@ -195,6 +203,7 @@ environments and only installs what changed.
 | `SSL: CERTIFICATE_VERIFY_FAILED` | Your mirror's certificate isn't trusted. See the `pip config set global.cert` command under [(b)](#b-internal-pypi-mirror-nexus-artifactory). |
 | `A package is missing from …wheelhouse` | The wheelhouse was downloaded on a different OS or Python minor version. Download it again on a matching machine. |
 | `The CLI's packages conflict` | Delete the `.venv-cli` folder and run the installer again. |
+| `FAIL  CLI matches the project files`, or a red *installed CLI is older* warning in the GUI | The project files were updated but the installer wasn't run again. Stop the GUI and run the same install command again. |
 | The menu in the GUI says **CLI not found** | Run the installer. If the CLI is installed elsewhere, set `PAN_OS_UPGRADE_PYTHON` to that environment's Python. |
 | `address already in use` / `error while attempting to bind` | The GUI is already running, or another program uses port 8080. Close it or use another port (see [4](#4-start-the-gui)). |
 | `Running scripts is disabled on this system` | That's PowerShell's execution policy. The installer doesn't use PowerShell scripts: run `gui\setup.cmd` from **Command Prompt** instead. |

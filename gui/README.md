@@ -10,7 +10,8 @@ below describes that CLI's behavior, mainly in
 [`main.py`](../pan_os_upgrade/main.py).
 
 > **Read [After the upgrade](#after-the-upgrade) before your first live run.** The tool suspends HA
-> on each member but never sets it back to functional.
+> on each member for its upgrade and makes it functional again afterwards; check the pair yourself
+> after every run.
 
 ## Running the GUI
 
@@ -55,14 +56,14 @@ The CLI processes both members of a pair in **two rounds**.
 
 ```
 Round 1 (both members start in parallel)
-  passive member ─ checks ─ suspend HA ─ download ─ snapshot ─ readiness ─ backup ─ install ─ reboot ─ post snapshot
+  passive member ─ checks ─ suspend HA ─ download ─ snapshot ─ readiness ─ backup ─ install ─ reboot ─ HA functional ─ post snapshot
   active member  ─ checks ─ "same version as peer" ─ deferred to round 2
                                     │
              round 1 finishes only after the passive member is done
                                     │
 Round 2
-  active member  ─ wait for HA sync ─ now older than its peer ─ suspend HA (traffic fails over
-                   to the upgraded member) ─ download ─ snapshot ─ readiness ─ backup ─ install ─ reboot ─ post snapshot
+  active member  ─ wait for peer ─ now older than its peer, peer passive ─ suspend HA (traffic fails over
+                   to the upgraded member) ─ download ─ snapshot ─ readiness ─ backup ─ install ─ reboot ─ HA functional ─ post snapshot
 ```
 
 ### Round 1
@@ -87,29 +88,42 @@ When the versions match, the members split:
   2. **Suspends its HA state.**
   3. Downloads the image, takes a pre-upgrade snapshot, runs the other readiness checks, checks HA
      sync, and backs up the configuration to `assurance/configurations/`.
-  4. Installs the new version, reboots, waits for the device to come back, then takes a
-     post-upgrade snapshot and writes a pre/post diff report to `assurance/snapshots/<host>/diff/`.
+  4. Installs the new version, reboots, and waits for the device to come back.
+  5. **Makes its HA state functional again** (*HA state restored to functional*), so it rejoins the
+     pair as passive. Suspended HA survives a reboot, so without this step the member would stay
+     out of the pair.
+  6. Takes a post-upgrade snapshot and writes a pre/post diff report to
+     `assurance/snapshots/<host>/diff/`.
 
-Round 1 ends when every member in it has finished.
+If the upgrade stops at any point after HA was suspended (a failed download, snapshot, check or
+install), the member's HA is made functional again before it stops.
 
-**Round 2 only starts if no member stopped the run in round 1.** When a member stops early (for
-example *Not ready for upgrade*, a failed blocking check, or *No upgrade required*), or reaches the
-end of a dry run, the CLI ends the whole run as soon as the other round-1 members finish. For an
-HA pair this is protective: if the passive member's upgrade fails, the active member isn't touched.
+Round 1 ends when every member in it has finished. **Round 2 always runs**, even if some devices
+stopped in round 1: one device's failure no longer ends the run. (Before the November 2026 fixes,
+any device stopping, or a dry run finishing, ended the run after round 1 and no active member was
+upgraded.) The run's exit code is 1 if any device stopped.
 
 ### Round 2
 
 Each deferred active member:
 
-1. **Waits for HA to sync.** It waits one interval, then checks whether the configuration is
-   synchronized, up to the configured number of tries. The defaults are 3 tries, 60 seconds apart,
-   so this always takes at least 60 seconds. **If the pair never reports synchronized, the upgrade
-   goes ahead anyway.**
+1. **Waits for its peer.** It waits one interval, then checks whether the pair is synchronized or
+   the upgraded peer is back as passive, up to `ha_sync.max_tries` tries. The defaults are 3 tries,
+   60 seconds apart, so this always takes at least 60 seconds.
 2. Compares versions again. Its peer was just upgraded, so this member is now **older**.
+   - **Peer still on the same version** (its upgrade failed, or it isn't in the inventory): the
+     member stops with *HA peer not upgraded*. Nothing changes on it. In a dry run it continues
+     its dry-run checks instead.
+   - **Peer not passive** (for example still suspended): the member stops with *HA peer not
+     ready* and is **not** suspended, because nothing could take over its traffic.
 3. Runs the HA readiness check, then **suspends its own HA state**. Traffic fails over to the
    member that was already upgraded.
-4. Goes through the same download, snapshot, readiness, backup, install, reboot and post-snapshot
-   steps as the passive member did.
+4. Goes through the same download, snapshot, readiness, backup, install, reboot, HA functional and
+   post-snapshot steps as the passive member did.
+
+An active member that finds its peer's version or state missing in round 1 (the peer is
+rebooting, for example) or its peer not yet passive is deferred to round 2 instead of failing.
+That makes the order of the inventory irrelevant: standbys don't need to be listed first.
 
 ### Version compatibility rule (HA pairs only)
 
@@ -129,8 +143,9 @@ For a blocked jump, upgrade in stages, for example 10.0 → 10.1, then 10.1 → 
 ## What you see in the GUI
 
 - **HA pairs box** on the Firewall, Panorama and Batch upgrade pages: a short version of this guide.
-  **Help → HA upgrade guide** in the side menu shows this README inside the GUI.
-- **Live upgrade confirmation:** includes a reminder that HA isn't restored automatically.
+  **Help → HA upgrade guide** in the side menu shows this README inside the GUI, and
+  **Help → What's new** shows the changes in the installed release.
+- **Live upgrade confirmation:** summarizes how HA members are suspended and restored.
 - **Header badge and Output panel:** *Running*, *Awaiting input*, *Completed*, *Failed* or *Stopped*,
   plus elapsed time. The Output panel shows the CLI's log for both members together, each line
   prefixed with the device hostname.
@@ -146,18 +161,29 @@ For a blocked jump, upgrade in stages, for example 10.0 → 10.1, then 10.1 → 
     latest message, versions, and warning and error counts.
   - **Device details and log:** select a row to see its stages, versions, the reason it stopped,
     its diff reports, and only that device's log lines, optionally just warnings and errors.
-  - **HA suspended banner:** lists every member the run suspended, so you know which ones need
-    `request high-availability state functional` afterwards.
+  - **HA suspended banner:** lists members the run suspended that haven't been made functional
+    again yet. During a run that's normal; after the run, any member still listed needs
+    `request high-availability state functional`.
+  - **Export results:** downloads one row per device (status, stage, versions, HA role and peer
+    state, problem, warning and error counts, reports) as a CSV file that opens in Excel.
+  - **Retry devices that need attention:** after a batch run, puts every device that *Failed*,
+    was *Not upgraded* or was *Interrupted* into the Batch upgrade form. Fix the cause (disk space,
+    HA state, pending changes), then dry-run or upgrade just those devices.
   - The tracker reads the CLI's console output; it doesn't query devices. A member already in
-    HA *suspended* state when the run starts is shown as *Not upgraded*: the CLI skips it without
-    logging why.
+    HA *suspended* state when the run starts fails with *HA state is suspended, so the CLI won't
+    upgrade it*.
 - **Lines to look for:**
   - *Added target device to revisit list*: the active member was deferred to round 2.
   - *Suspending HA state of passive or active-secondary*: the passive member is starting its upgrade.
   - *Revisiting firewalls that were active in an HA pair*: round 2 has started.
   - *Waiting for HA synchronization to complete*: round 2's sync wait.
   - *Suspending HA state of active or active-primary*: failover to the upgraded member.
+  - *HA state restored to functional*: a member rejoined the pair after its upgrade.
+  - *HA peer not ready* / *HA peer not upgraded*: round 2 stopped an active member safely, without
+    suspending it.
 - **Run history** keeps the full output of every GUI run in `gui/workspace/console/`.
+- **Environment** (bottom of the side menu): the version of the project files and of the installed
+  CLI. If the CLI is older, a red warning at the top of every page says to run the setup again.
 
 A live HA upgrade takes at least two full download-install-reboot cycles, one after the other, plus
 the sync wait. Closing the browser tab is safe: the run continues and you can reopen the page. If
@@ -167,16 +193,11 @@ and you can no longer answer prompts or stop it from the GUI. Its output is stil
 
 ## Dry run with an HA pair
 
-A dry run is **not** side-effect free, and for HA pairs it only tests one member:
+A dry run is **not** side-effect free (it downloads the image), but it never suspends HA:
 
 - The **passive member** downloads the target image, takes a snapshot, runs readiness checks and
-  backs up its configuration, then stops. Its HA state is **not** suspended.
-- The **active member** is deferred, as in a live run. The passive member's dry run ends the whole
-  run, so round 2 never starts. **The active member gets no readiness checks, snapshot or backup
-  in a dry run.**
-
-To dry-run the active member on its own, use the **Firewall** page on a standalone test device, or
-treat the passive member's results as representative.
+  backs up its configuration, then stops.
+- The **active member** is deferred, as in a live run, and runs the same dry-run checks in round 2.
 
 ## Peers on different versions
 
@@ -198,7 +219,7 @@ or upgrade one member at a time from the **Firewall** page and enter only that m
 | `active`, `active-primary`           | Deferred to round 2 |
 | `passive`, `active-secondary`        | Upgraded in round 1, HA suspended first |
 | `initial`                            | Upgraded in round 1, HA **not** suspended (warning logged) |
-| Anything else (e.g. `suspended`, `non-functional`) | **Skipped**, nothing is upgraded |
+| Anything else (e.g. `suspended`, `non-functional`) | **Stops** with *HA state is …, so the CLI won't upgrade it*; nothing changes |
 
 For Panorama, `secondary-suspended` and `secondary-non-functional` members are upgraded in round 1
 without being suspended again.
@@ -212,18 +233,19 @@ both use this setting).
 - **Both members listed:** works as described above.
 - **Only the passive member listed:** the passive member is upgraded. The active member isn't
   touched, which leaves the pair on mismatched versions.
-- **Only the active member listed (same version):** it's deferred in round 1 and deferred again in
-  round 2, because its peer was never upgraded. **Nothing is upgraded.**
-- **One device can cancel round 2 for every pair.** If any device in round 1 stops (already on the
-  target version, *Not ready for upgrade*, a failed blocking check), the run ends after round 1 and
-  **none of the deferred active members are upgraded**. The passive members of the other pairs are
-  still upgraded, leaving those pairs on mismatched versions. Remove devices that are already on
-  the target from the list, and dry-run first.
+- **Only the active member listed (same version):** it's deferred in round 1 and stops in round 2
+  with *HA peer not upgraded*. Nothing changes on it.
+- **The order of the list doesn't matter.** Standalones, passives and actives can be mixed.
+- **One device stopping doesn't affect the others.** Each device that fails is marked *Failed* in
+  the tracker with the reason; every other device, including round 2, carries on. Use **Retry
+  devices that need attention** in the tracker to run the failed ones again once fixed.
 
 ## After the upgrade
 
-**The CLI suspends HA on each member and never sets it back to functional.** It doesn't run
-`request high-availability state functional` at any point. After a live run, check both members:
+Each member the CLI suspended is made functional again after its reboot (or when its upgrade
+stops), retrying `ha_sync.max_tries` times. If that fails, the log says *Failed to restore HA state
+to functional* and the tracker's HA suspended banner lists the member. After a live run, check both
+members:
 
 ```
 show high-availability state
@@ -249,18 +271,15 @@ Then confirm that:
 | Readiness check `ha` | GUI → Settings → Readiness checks | The HA check that runs just before HA is suspended. A failure stops that member's upgrade. On by default. |
 | Concurrent threads | GUI → Settings → Execution | How many members run at once in batch upgrades, and in round 2 for the Firewall page. |
 | Reboot interval / max tries | GUI → Settings → Retry policy | How long the CLI waits for a member to come back after reboot. Default: 30 tries × 60 s. |
-| `ha_sync.max_tries`, `ha_sync.retry_interval` | **Not shown in the GUI.** Add them by hand to `gui/workspace/settings.yaml`. | Round 2's HA sync wait. Default: 3 tries × 60 s. Saving from the Settings page rewrites the file and drops these keys, so add them again after every save. |
+| HA sync interval / max tries (`ha_sync.*`) | GUI → Settings → Retry policy | Round 2's wait for the peer, and the attempts to make a suspended member functional again. Default: 3 tries × 60 s. |
+| Download / Snapshots interval and max tries, download timeout | GUI → Settings → Retry policy | The per-device error limits: a device fails after this many download or snapshot attempts, or when a download hasn't finished within the timeout (default 3600 s per try), instead of retrying forever. |
 
 ## Known issues
 
 These are CLI behaviors, not GUI behaviors. They're listed so you can plan around them.
 
-1. **A dry run can suspend HA when the versions differ.** In
-   [`ha.py`](../pan_os_upgrade/components/ha.py), the "older" and "newer" branches combine `or` and `and`
-   without parentheses. As a result, an `active` member (older case) or a `passive` member (newer
-   case) is suspended **even during a dry run**. It doesn't happen when both members run the same version.
-2. **The out-of-sync warning doesn't stop the upgrade.** The pre-upgrade HA sync check only logs a
-   warning, and round 2 goes ahead even if the pair never reports synchronized.
-3. **Panorama, newer-version case.** When the `primary-active` appliance is on a newer version than its
-   peer, the CLI suspends the `primary-active` appliance, not the `secondary-passive` one.
-4. **HA is not restored automatically.** See [After the upgrade](#after-the-upgrade).
+1. **The out-of-sync warning doesn't stop the upgrade.** The pre-upgrade HA sync check only logs a
+   warning. Round 2 only requires the upgraded peer to be passive, not synchronized (a pair on two
+   different releases may not report synchronized).
+2. **Peers on different versions that both need the upgrade** can still be upgraded at the same
+   time. See [Peers on different versions](#peers-on-different-versions).

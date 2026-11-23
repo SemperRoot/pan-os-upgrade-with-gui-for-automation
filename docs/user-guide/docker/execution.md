@@ -430,6 +430,7 @@ concurrency:
 download:
   max_tries: 3
   retry_interval: 60
+  timeout: 3600
 install:
   max_tries: 3
   retry_interval: 60

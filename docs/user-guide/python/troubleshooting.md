@@ -28,6 +28,11 @@ Encountering issues while using the `pan-os-upgrade` tool is not uncommon, espec
 
 **Solution:** Interrupt the script (Ctrl+C) and check the log files for any clues. Common issues might be network latency or firewall response delays.
 
+Downloads and snapshots no longer wait indefinitely: a device stops after `download.max_tries` download attempts
+(each limited to `download.timeout` seconds, default 3600) or `snapshots.max_tries` snapshot attempts, and the
+other devices carry on. Raise these in `settings.yaml` if your links are slow. A device that stops in a batch
+run no longer prevents round 2 (HA active members) from running.
+
 ### 5. Incorrect PAN-OS Version
 
 **Problem:** The wrong PAN-OS version is downloaded or installed.

@@ -1,4 +1,4 @@
-# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows.
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): files are read and written as UTF-8 so they work on Windows; a device thread that stops with sys.exit() no longer ends the whole batch, so round 2 (HA active members) runs; settings asks for a download timeout; error tracebacks no longer print local variables (they included the password); a Panorama with no connected firewalls stops with a clear message.
 """
 upgrade.py: Automating the Upgrade Process for Palo Alto Networks Devices with PDF Reporting
 
@@ -121,7 +121,9 @@ from pan_os_upgrade.components.utilities import (
 
 
 # Define Typer command-line interface
-app = typer.Typer(help="PAN-OS Upgrade script")
+# pretty_exceptions_show_locals=False: Typer's default error display prints every local variable,
+# which includes the password typed at the prompt
+app = typer.Typer(help="PAN-OS Upgrade script", pretty_exceptions_show_locals=False)
 
 # Define the path to the settings file
 SETTINGS_FILE_PATH = Path.cwd() / "settings.yaml"
@@ -139,6 +141,56 @@ init()
 # Global list and lock for storing HA active firewalls and Panorama to revisit
 target_devices_to_revisit = []
 target_devices_to_revisit_lock = Lock()
+
+
+# Devices whose upgrade thread stopped with an error during this run, for the exit code
+stopped_devices = []
+
+
+def wait_for_upgrades(future_to_device: dict, hostname: str, device_kind: str) -> None:
+    """
+    Wait for every device's upgrade thread and log the ones that stopped.
+
+    The upgrade functions call sys.exit() when a device can't continue, and after a dry run. SystemExit
+    isn't an Exception, so it used to escape this loop: the first device to stop ended the whole run
+    once the other threads finished, and round 2 (HA active members) never ran.
+    """
+    for future in as_completed(future_to_device):
+        device = future_to_device[future]
+        name = getattr(device, "serial", None) or getattr(device, "hostname", None)
+        try:
+            future.result()
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
+                stopped_devices.append(name)
+                logging.error(
+                    f"{get_emoji(action='error')} {hostname}: {device_kind} {name} stopped (exit code {exc.code})."
+                )
+        except Exception as exc:
+            stopped_devices.append(name)
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: {device_kind} {name} generated an exception: {exc}"
+            )
+
+
+def require_connected_firewalls(all_firewalls: list, hostname: str) -> None:
+    """Stop with a clear message when Panorama has no connected firewalls to work with."""
+    if not all_firewalls:
+        logging.error(
+            f"{get_emoji(action='error')} {hostname}: Panorama reports no connected firewalls "
+            "(show devices connected). Check that the firewalls are connected to this Panorama, then try again."
+        )
+        sys.exit(1)
+
+
+def exit_if_any_stopped(hostname: str) -> None:
+    """Exit with code 1 if any device's upgrade stopped, as the run did before devices were isolated."""
+    if stopped_devices:
+        logging.error(
+            f"{get_emoji(action='error')} {hostname}: {len(stopped_devices)} device(s) didn't finish: "
+            + ", ".join(str(name) for name in stopped_devices)
+        )
+        sys.exit(1)
 
 # Define logging levels
 LOGGING_LEVELS = {
@@ -333,14 +385,7 @@ def firewall(
         }
 
         # Process completed tasks
-        for future in as_completed(future_to_firewall):
-            firewall = future_to_firewall[future]
-            try:
-                future.result()
-            except Exception as exc:
-                logging.error(
-                    f"{get_emoji(action='error')} {hostname}: Firewall {firewall.hostname} generated an exception: {exc}"
-                )
+        wait_for_upgrades(future_to_firewall, hostname, "Firewall")
 
     # Second round of upgrades, revisiting firewalls that were active in an HA pair and had the same version as their peers
     if target_devices_to_revisit:
@@ -365,25 +410,17 @@ def firewall(
                     target_devices_to_revisit_lock=target_devices_to_revisit_lock,
                     target_version=target_version,
                 ): target_device
-                for target_device in target_devices_to_revisit
+                for target_device in list(target_devices_to_revisit)
             }
 
             # Process completed tasks
-            for future in as_completed(future_to_firewall):
-                firewall = future_to_firewall[future]
-                try:
-                    future.result()
-                    logging.info(
-                        f"{get_emoji(action='success')} {hostname}: Completed revisiting firewalls"
-                    )
-                except Exception as exc:
-                    logging.error(
-                        f"{get_emoji(action='error')} {hostname}: Exception while revisiting firewalls: {exc}"
-                    )
+            wait_for_upgrades(future_to_firewall, hostname, "Firewall")
 
         # Clear the list after revisiting
         with target_devices_to_revisit_lock:
             target_devices_to_revisit.clear()
+
+    exit_if_any_stopped(hostname)
 
 
 # Subcommand for upgrading Panorama
@@ -538,14 +575,7 @@ def panorama(
         }
 
         # Process completed tasks
-        for future in as_completed(future_to_panorama):
-            panorama = future_to_panorama[future]
-            try:
-                future.result()
-            except Exception as exc:
-                logging.error(
-                    f"{get_emoji(action='error')} {hostname}: Panorama {panorama.hostname} generated an exception: {exc}"
-                )
+        wait_for_upgrades(future_to_panorama, hostname, "Panorama")
 
     # Second round of upgrades, revisiting panoramas that were active in an HA pair and had the same version as their peers
     if target_devices_to_revisit:
@@ -570,25 +600,17 @@ def panorama(
                     target_devices_to_revisit_lock=target_devices_to_revisit_lock,
                     target_version=target_version,
                 ): target_device
-                for target_device in target_devices_to_revisit
+                for target_device in list(target_devices_to_revisit)
             }
 
             # Process completed tasks
-            for future in as_completed(future_to_panorama):
-                panorama = future_to_panorama[future]
-                try:
-                    future.result()
-                    logging.info(
-                        f"{get_emoji(action='success')} {hostname}: Completed revisiting panoramas"
-                    )
-                except Exception as exc:
-                    logging.error(
-                        f"{get_emoji(action='error')} {hostname}: Exception while revisiting panoramas: {exc}"
-                    )
+            wait_for_upgrades(future_to_panorama, hostname, "Panorama")
 
         # Clear the list after revisiting
         with target_devices_to_revisit_lock:
             target_devices_to_revisit.clear()
+
+    exit_if_any_stopped(hostname)
 
 
 # Subcommand for batch upgrades using Panorama as a communication proxy
@@ -761,6 +783,7 @@ def batch(
         f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
     )
     all_firewalls = get_firewalls_from_panorama(panorama=device)
+    require_connected_firewalls(all_firewalls, hostname)
 
     # Retrieve additional information about all of the firewalls
     logging.info(
@@ -884,14 +907,7 @@ def batch(
             }
 
             # Process completed tasks
-            for future in as_completed(future_to_firewall):
-                firewall = future_to_firewall[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    logging.error(
-                        f"{get_emoji(action='error')} {hostname}: Firewall {firewall.hostname} generated an exception: {exc}"
-                    )
+            wait_for_upgrades(future_to_firewall, hostname, "Firewall")
 
         # Second round of upgrades, revisiting firewalls that were active in an HA pair and had the same version as their peers
         if target_devices_to_revisit:
@@ -916,25 +932,17 @@ def batch(
                         target_devices_to_revisit_lock=target_devices_to_revisit_lock,
                         target_version=target_version,
                     ): target_device
-                    for target_device in target_devices_to_revisit
+                    for target_device in list(target_devices_to_revisit)
                 }
 
                 # Process completed tasks
-                for future in as_completed(future_to_firewall):
-                    firewall = future_to_firewall[future]
-                    try:
-                        future.result()
-                        logging.info(
-                            f"{get_emoji(action='success')} {hostname}: Completed revisiting firewalls"
-                        )
-                    except Exception as exc:
-                        logging.error(
-                            f"{get_emoji(action='error')} {hostname}: Exception while revisiting firewalls: {exc}"
-                        )
+                wait_for_upgrades(future_to_firewall, hostname, "Firewall")
 
             # Clear the list after revisiting
             with target_devices_to_revisit_lock:
                 target_devices_to_revisit.clear()
+
+        exit_if_any_stopped(hostname)
     else:
         typer.echo("Upgrade cancelled.")
 
@@ -1110,6 +1118,7 @@ def backup(
                 f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
             )
             all_firewalls = get_firewalls_from_panorama(panorama=device)
+            require_connected_firewalls(all_firewalls, hostname)
             logging.info(
                 f"{get_emoji(action='working')} {hostname}: Retrieving detailed information of each firewall..."
             )
@@ -1321,6 +1330,7 @@ def inventory(
         f"{get_emoji(action='working')} {hostname}: Retrieving a list of all firewalls connected to Panorama..."
     )
     all_firewalls = get_firewalls_from_panorama(panorama=device)
+    require_connected_firewalls(all_firewalls, hostname)
 
     # Retrieve additional information about all of the firewalls
     logging.info(
@@ -1410,6 +1420,11 @@ def settings():
             "max_tries": typer.prompt(
                 "PAN-OS maximum download tries",
                 default=3,
+                type=int,
+            ),
+            "timeout": typer.prompt(
+                "PAN-OS download timeout per try (seconds)",
+                default=3600,
                 type=int,
             ),
         },

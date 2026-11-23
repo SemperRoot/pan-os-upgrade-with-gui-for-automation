@@ -1,3 +1,4 @@
+# Modified from pan-os-upgrade 1.3.11 (https://github.com/cdot65/pan-os-upgrade, Apache License 2.0): HA members this run suspends are made functional again after their upgrade (or when it stops); an active member is only suspended once its peer is passive and can take over; a missing peer version or state defers the device to round 2 instead of crashing; round 2 stops with a clear error instead of deferring again; failed suspensions stop the upgrade; dry runs never suspend.
 import logging
 import sys
 import time
@@ -18,6 +19,148 @@ from pan_os_upgrade.components.assurance import (
     perform_readiness_checks,
     get_checks_list,
 )
+
+
+# HA states in which a peer can take over traffic when this member is suspended
+PEER_READY_STATES = ("passive", "active-secondary")
+
+# Devices whose HA state this run suspended, so the same thread can make them functional again once
+# their upgrade ends, whether it succeeded or stopped. Keyed by device_key().
+_suspended_by_run: set = set()
+_suspended_by_run_lock = Lock()
+
+
+def device_key(target_device: Union[Firewall, Panorama]) -> str:
+    """Identify a device across calls: its serial number, or the address used to reach it."""
+    return str(
+        getattr(target_device, "serial", None)
+        or getattr(target_device, "hostname", None)
+        or id(target_device)
+    )
+
+
+def suspended_by_run(target_device: Union[Firewall, Panorama]) -> bool:
+    """True if this run suspended the device's HA state and hasn't restored it yet."""
+    with _suspended_by_run_lock:
+        return device_key(target_device) in _suspended_by_run
+
+
+def firewall_ha_states(ha_details: Optional[dict]) -> Tuple[Optional[str], ...]:
+    """
+    Local state, local version, peer state and peer version from a firewall's HA details.
+
+    Values the firewall doesn't report are None. peer-info has no version or state while the peer
+    is rebooting or HA1 is down, so the keys can't be read directly.
+    """
+    group = ((ha_details or {}).get("result") or {}).get("group") or {}
+    local = group.get("local-info") or {}
+    peer = group.get("peer-info") or {}
+    return local.get("state"), local.get("build-rel"), peer.get("state"), peer.get("build-rel")
+
+
+def panorama_ha_states(ha_details: Optional[dict]) -> Tuple[Optional[str], ...]:
+    """Local state, local version, peer state and peer version from a Panorama's HA details."""
+    result = (ha_details or {}).get("result") or {}
+    local = result.get("local-info") or {}
+    peer = result.get("peer-info") or {}
+    return local.get("state"), local.get("build-rel"), peer.get("state"), peer.get("build-rel")
+
+
+def ha_retry_settings(settings_file: LazySettings, settings_file_path: Path) -> Tuple[int, int]:
+    """ha_sync.max_tries and ha_sync.retry_interval from settings.yaml, defaulting to 3 and 60 seconds."""
+    max_retries, retry_interval = 3, 60
+    if settings_file_path is not None and settings_file_path.exists() and settings_file is not None:
+        max_retries = settings_file.get("ha_sync.max_tries", max_retries)
+        retry_interval = settings_file.get("ha_sync.retry_interval", retry_interval)
+    return max(1, int(max_retries)), max(0, int(retry_interval))
+
+
+def defer_to_round_two(
+    hostname: str,
+    reason: str,
+    target_device: Union[Firewall, Panorama],
+    target_devices_to_revisit: list,
+    target_devices_to_revisit_lock: Lock,
+) -> None:
+    """Put a device on the revisit list so the batch command upgrades it after round 1 finishes."""
+    with target_devices_to_revisit_lock:
+        if target_device not in target_devices_to_revisit:
+            target_devices_to_revisit.append(target_device)
+    logging.info(
+        f"{get_emoji(action='search')} {hostname}: Waiting for round 2 because {reason}. Added target device to revisit list."
+    )
+
+
+def restore_ha_functional(
+    target_device: Union[Firewall, Panorama],
+    hostname: str,
+    settings_file: LazySettings = None,
+    settings_file_path: Path = None,
+) -> bool:
+    """
+    Make a device's HA state functional again if this run suspended it.
+
+    Suspended HA survives a reboot, so without this an upgraded member stays suspended: it never
+    rejoins the pair, HA links stay down, and its peer can't fail over to it when its own turn comes.
+    Called after the reboot and whenever an upgrade stops after suspending. Does nothing for devices
+    this run didn't suspend.
+
+    Retries ha_sync.max_tries times, ha_sync.retry_interval seconds apart, since HA may still be
+    starting right after a reboot. Returns True if HA is functional (or was never suspended).
+    """
+    if not suspended_by_run(target_device):
+        return True
+
+    max_retries, retry_interval = ha_retry_settings(settings_file, settings_file_path)
+    logging.info(
+        f"{get_emoji(action='start')} {hostname}: Restoring HA state to functional (this run suspended it)."
+    )
+
+    for attempt in range(1, max_retries + 1):
+        result = ""
+        try:
+            response = target_device.op(
+                "<request><high-availability><state><functional/></state></high-availability></request>",
+                cmd_xml=False,
+            )
+            result = str(flatten_xml_to_dict(response).get("result", ""))
+        except Exception as error:
+            result = f"error: {error}"
+
+        if "functional" in result.lower() and "error" not in result.lower():
+            with _suspended_by_run_lock:
+                _suspended_by_run.discard(device_key(target_device))
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: HA state restored to functional."
+            )
+            return True
+
+        # The command can fail when HA isn't suspended any more; check before retrying
+        try:
+            _, ha_details = get_ha_status(hostname=hostname, target_device=target_device)
+            group = ((ha_details or {}).get("result") or {})
+            local = (group.get("group") or group).get("local-info") or {}
+            state = local.get("state")
+        except Exception:
+            state = None
+        if state and "suspended" not in state and state not in ("initial", "unknown"):
+            with _suspended_by_run_lock:
+                _suspended_by_run.discard(device_key(target_device))
+            logging.info(
+                f"{get_emoji(action='success')} {hostname}: HA state restored to functional ({state})."
+            )
+            return True
+
+        if attempt < max_retries:
+            logging.warning(
+                f"{get_emoji(action='warning')} {hostname}: Couldn't restore HA state to functional yet (attempt {attempt} of {max_retries}: {result or state}). Retrying in {retry_interval} seconds."
+            )
+            time.sleep(retry_interval)
+
+    logging.error(
+        f"{get_emoji(action='error')} {hostname}: Failed to restore HA state to functional after {max_retries} attempts. Run request high-availability state functional on it."
+    )
+    return False
 
 
 def ha_sync_check_firewall(
@@ -243,28 +386,20 @@ def handle_firewall_ha(
     )
     logging.debug(f"{get_emoji(action='report')} {hostname}: HA details: {ha_details}")
 
-    local_state = ha_details["result"]["group"]["local-info"]["state"]
-    local_version = ha_details["result"]["group"]["local-info"]["build-rel"]
-    peer_version = ha_details["result"]["group"]["peer-info"]["build-rel"]
+    local_state, local_version, peer_state, peer_version = firewall_ha_states(ha_details)
 
     logging.info(
         f"{get_emoji(action='report')} {hostname}: Local state: {local_state}, Local version: {local_version}, Peer version: {peer_version}"
     )
+    logging.info(f"{get_emoji(action='report')} {hostname}: HA peer state: {peer_state}")
 
     # Check if the firewall is in the revisit list
     with target_devices_to_revisit_lock:
         is_device_to_revisit = target_device in target_devices_to_revisit
 
+    max_retries, retry_interval = ha_retry_settings(settings_file, settings_file_path)
+
     if is_device_to_revisit:
-        # Initialize with default values
-        max_retries = 3
-        retry_interval = 60
-
-        # Override if settings.yaml exists and contains these settings
-        if settings_file_path.exists():
-            max_retries = settings_file.get("ha_sync.max_tries", max_retries)
-            retry_interval = settings_file.get("ha_sync.retry_interval", retry_interval)
-
         for attempt in range(max_retries):
             logging.info(
                 f"Waiting for HA synchronization to complete on {hostname}. Attempt {attempt + 1}/{max_retries}"
@@ -277,10 +412,14 @@ def handle_firewall_ha(
                 hostname=hostname,
                 target_device=target_device,
             )
-            local_version = ha_details["result"]["group"]["local-info"]["build-rel"]
-            peer_version = ha_details["result"]["group"]["peer-info"]["build-rel"]
+            local_state, local_version, peer_state, peer_version = firewall_ha_states(
+                ha_details
+            )
 
-            if ha_details["result"]["group"]["running-sync"] == "synchronized":
+            running_sync = (ha_details or {}).get("result", {}).get("group", {}).get("running-sync")
+            if running_sync == "synchronized" or (
+                peer_state in PEER_READY_STATES and peer_version != local_version
+            ):
                 logging.info(
                     f"HA synchronization complete on {hostname}. Proceeding with upgrade."
                 )
@@ -289,6 +428,27 @@ def handle_firewall_ha(
                 logging.info(
                     f"HA synchronization still in progress on {hostname}. Rechecking after wait period."
                 )
+
+        logging.info(
+            f"{get_emoji(action='report')} {hostname}: Local state: {local_state}, Local version: {local_version}, Peer version: {peer_version}"
+        )
+        logging.info(f"{get_emoji(action='report')} {hostname}: HA peer state: {peer_state}")
+
+    # The peer is rebooting, down, or HA1 is disconnected, so its version and state are unknown
+    if not peer_version or not local_version:
+        if is_device_to_revisit:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: HA peer not ready: its version and state still aren't available in round 2. Not upgrading this firewall. Check the HA pair, then run it again."
+            )
+            sys.exit(1)
+        defer_to_round_two(
+            hostname=hostname,
+            reason="its HA peer isn't reporting a version or state (it may be rebooting)",
+            target_device=target_device,
+            target_devices_to_revisit=target_devices_to_revisit,
+            target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+        )
+        return False, None
 
     version_comparison = compare_versions(
         version1=local_version,
@@ -303,6 +463,19 @@ def handle_firewall_ha(
 
         # if the current device is active or active-primary
         if local_state == "active" or local_state == "active-primary":
+
+            if is_device_to_revisit:
+                if dry_run:
+                    # The peer's dry run didn't upgrade it, so the versions still match. Finish the
+                    # dry run checks on this firewall instead of deferring it forever.
+                    logging.info(
+                        f"{get_emoji(action='report')} {hostname}: Its HA peer still runs {peer_version} because this is a dry run. In a real run the peer is upgraded first. Continuing the dry run."
+                    )
+                    return True, None
+                logging.error(
+                    f"{get_emoji(action='error')} {hostname}: HA peer not upgraded: the peer still runs {peer_version}, so it wasn't upgraded in round 1 (it failed, or it isn't in this run's inventory). Not upgrading this active firewall. Upgrade the peer first, then run this firewall again."
+                )
+                sys.exit(1)
 
             # Add the target device to the revisit list and exit the upgrade process
             with target_devices_to_revisit_lock:
@@ -338,10 +511,14 @@ def handle_firewall_ha(
                 logging.info(
                     f"{get_emoji(action='report')} {hostname}: Suspending HA state of passive or active-secondary"
                 )
-                suspend_ha_passive(
+                if not suspend_ha_passive(
                     target_device,
                     hostname,
-                )
+                ):
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                    )
+                    sys.exit(1)
 
             # log message to console
             else:
@@ -359,32 +536,72 @@ def handle_firewall_ha(
             )
             return True, None
 
+        else:
+            # suspended, non-functional, tentative...: the upgrade doesn't know which member should
+            # carry traffic, so it leaves the pair alone
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: HA state is {local_state}, so the CLI won't upgrade it. If it was left suspended, run request high-availability state functional on it, then run it again."
+            )
+            sys.exit(1)
+
     elif version_comparison == "older":
         logging.info(
             f"{get_emoji(action='report')} {hostname}: Target device is on an older version"
         )
         # Suspend HA state of active if the passive is on a later release
-        if local_state == "active" or local_state == "active-primary" and not dry_run:
-            if any(
-                check == "ha" or (isinstance(check, dict) and "ha" in check)
-                for check in selected_checks
-            ):
-                logging.info(
-                    f"{get_emoji(action='start')} {hostname}: Performing pre-upgrade HA status check."
-                )
-                perform_readiness_checks(
-                    file_path=f'assurance/readiness_checks/{hostname}/pre/ha_{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
-                    firewall=target_device,
+        if local_state == "active" or local_state == "active-primary":
+
+            # Suspending the active fails traffic over to the peer, so the peer must be able to take it.
+            # A peer that's still suspended from its own upgrade would leave neither member active.
+            if peer_state not in PEER_READY_STATES:
+                if dry_run:
+                    logging.warning(
+                        f"{get_emoji(action='warning')} {hostname}: HA peer is {peer_state}. A real run wouldn't suspend this active firewall until the peer is passive. Continuing the dry run."
+                    )
+                    return True, None
+                if is_device_to_revisit:
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: HA peer not ready: the peer is {peer_state}, so it can't take over traffic. Not suspending this active firewall. Make the peer functional (request high-availability state functional), then run this firewall again."
+                    )
+                    sys.exit(1)
+                defer_to_round_two(
                     hostname=hostname,
-                    checks=["ha"],
+                    reason=f"its HA peer is {peer_state} and can't take over traffic yet",
+                    target_device=target_device,
+                    target_devices_to_revisit=target_devices_to_revisit,
+                    target_devices_to_revisit_lock=target_devices_to_revisit_lock,
                 )
-            logging.info(
-                f"{get_emoji(action='report')} {hostname}: Suspending HA state of active or active-primary"
-            )
-            suspend_ha_active(
-                target_device,
-                hostname,
-            )
+                return False, None
+
+            if not dry_run:
+                if any(
+                    check == "ha" or (isinstance(check, dict) and "ha" in check)
+                    for check in selected_checks
+                ):
+                    logging.info(
+                        f"{get_emoji(action='start')} {hostname}: Performing pre-upgrade HA status check."
+                    )
+                    perform_readiness_checks(
+                        file_path=f'assurance/readiness_checks/{hostname}/pre/ha_{time.strftime("%Y-%m-%d_%H-%M-%S")}.json',
+                        firewall=target_device,
+                        hostname=hostname,
+                        checks=["ha"],
+                    )
+                logging.info(
+                    f"{get_emoji(action='report')} {hostname}: Suspending HA state of active or active-primary"
+                )
+                if not suspend_ha_active(
+                    target_device,
+                    hostname,
+                ):
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                    )
+                    sys.exit(1)
+            else:
+                logging.info(
+                    f"{get_emoji(action='report')} {hostname}: Target device is active, but we are in dry-run mode. Skipping HA state suspension.",
+                )
         return True, None
 
     elif version_comparison == "newer":
@@ -393,10 +610,8 @@ def handle_firewall_ha(
         )
         # Suspend HA state of passive if the active is on a later release
         if (
-            local_state == "passive"
-            or local_state == "active-secondary"
-            and not dry_run
-        ):
+            local_state == "passive" or local_state == "active-secondary"
+        ) and not dry_run:
             if any(
                 check == "ha" or (isinstance(check, dict) and "ha" in check)
                 for check in selected_checks
@@ -413,13 +628,20 @@ def handle_firewall_ha(
             logging.info(
                 f"{get_emoji(action='report')} {hostname}: Suspending HA state of passive or active-secondary"
             )
-            suspend_ha_passive(
+            if not suspend_ha_passive(
                 target_device,
                 hostname,
-            )
+            ):
+                logging.error(
+                    f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                )
+                sys.exit(1)
         return True, None
 
-    return False, None
+    logging.error(
+        f"{get_emoji(action='error')} {hostname}: Couldn't compare its version ({local_version}) with its HA peer's ({peer_version}). Not upgrading it."
+    )
+    sys.exit(1)
 
 
 def handle_panorama_ha(
@@ -490,29 +712,20 @@ def handle_panorama_ha(
     )
     logging.debug(f"{get_emoji(action='report')} {hostname}: HA details: {ha_details}")
 
-    local_state = ha_details["result"]["local-info"]["state"]
-    local_version = ha_details["result"]["local-info"]["build-rel"]
-    # peer_state = ha_details["result"]["peer-info"]["state"]
-    peer_version = ha_details["result"]["peer-info"]["build-rel"]
+    local_state, local_version, peer_state, peer_version = panorama_ha_states(ha_details)
 
     logging.info(
         f"{get_emoji(action='report')} {hostname}: Local state: {local_state}, Local version: {local_version}, Peer version: {peer_version}"
     )
+    logging.info(f"{get_emoji(action='report')} {hostname}: HA peer state: {peer_state}")
 
     # Check if the firewall is in the revisit list
     with target_devices_to_revisit_lock:
         is_device_to_revisit = target_device in target_devices_to_revisit
 
+    max_retries, retry_interval = ha_retry_settings(settings_file, settings_file_path)
+
     if is_device_to_revisit:
-        # Initialize with default values
-        max_retries = 3
-        retry_interval = 60
-
-        # Override if settings.yaml exists and contains these settings
-        if settings_file_path.exists():
-            max_retries = settings_file.get("ha_sync.max_tries", max_retries)
-            retry_interval = settings_file.get("ha_sync.retry_interval", retry_interval)
-
         for attempt in range(max_retries):
             logging.info(
                 f"Waiting for HA synchronization to complete on {hostname}. Attempt {attempt + 1}/{max_retries}"
@@ -525,10 +738,11 @@ def handle_panorama_ha(
                 hostname=hostname,
                 target_device=target_device,
             )
-            local_version = ha_details["result"]["local-info"]["build-rel"]
-            peer_version = ha_details["result"]["peer-info"]["build-rel"]
+            local_state, local_version, peer_state, peer_version = panorama_ha_states(
+                ha_details
+            )
 
-            if peer_version != local_version:
+            if peer_version and peer_version != local_version and str(peer_state).endswith("-passive"):
                 logging.info(
                     f"HA synchronization complete on {hostname}. Proceeding with upgrade."
                 )
@@ -538,6 +752,27 @@ def handle_panorama_ha(
                     f"HA synchronization still in progress on {hostname}. Rechecking after wait period."
                 )
 
+        logging.info(
+            f"{get_emoji(action='report')} {hostname}: Local state: {local_state}, Local version: {local_version}, Peer version: {peer_version}"
+        )
+        logging.info(f"{get_emoji(action='report')} {hostname}: HA peer state: {peer_state}")
+
+    # The peer is rebooting, down, or HA is disconnected, so its version and state are unknown
+    if not peer_version or not local_version:
+        if is_device_to_revisit:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: HA peer not ready: its version and state still aren't available in round 2. Not upgrading this Panorama. Check the HA pair, then run it again."
+            )
+            sys.exit(1)
+        defer_to_round_two(
+            hostname=hostname,
+            reason="its HA peer isn't reporting a version or state (it may be rebooting)",
+            target_device=target_device,
+            target_devices_to_revisit=target_devices_to_revisit,
+            target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+        )
+        return False, None
+
     version_comparison = compare_versions(
         version1=local_version,
         version2=peer_version,
@@ -546,11 +781,26 @@ def handle_panorama_ha(
         f"{get_emoji(action='report')} {hostname}: Version comparison: {version_comparison}"
     )
 
+    local_active = str(local_state).endswith("-active")
+    local_passive = str(local_state).endswith("-passive")
+    peer_ready = str(peer_state).endswith("-passive")
+
     # If the active and passive target devices are running the same version
     if version_comparison == "equal":
 
-        # If the current device is primary-active
-        if local_state == "primary-active":
+        # If the current device is active (primary-active, or secondary-active after a failover)
+        if local_active:
+
+            if is_device_to_revisit:
+                if dry_run:
+                    logging.info(
+                        f"{get_emoji(action='report')} {hostname}: Its HA peer still runs {peer_version} because this is a dry run. In a real run the peer is upgraded first. Continuing the dry run."
+                    )
+                    return True, None
+                logging.error(
+                    f"{get_emoji(action='error')} {hostname}: HA peer not upgraded: the peer still runs {peer_version}, so it wasn't upgraded in round 1. Not upgrading this active Panorama. Upgrade the peer first, then run this Panorama again."
+                )
+                sys.exit(1)
 
             # Add the active target device to the list and exit the upgrade process
             with target_devices_to_revisit_lock:
@@ -558,29 +808,33 @@ def handle_panorama_ha(
 
             # Log message to console
             logging.info(
-                f"{get_emoji(action='search')} {hostname}: Detected primary-active target device in HA pair running the same version as its peer. Added target device to revisit list."
+                f"{get_emoji(action='search')} {hostname}: Detected {local_state} target device in HA pair running the same version as its peer. Added target device to revisit list."
             )
 
             # Exit the upgrade process for the target device at this time, to be revisited later
             return False, None
 
-        # if the current device is secondary-passive
-        elif local_state == "secondary-passive":
+        # if the current device is passive
+        elif local_passive:
 
             # suspend HA state of the target device
             if not dry_run:
                 logging.info(
-                    f"{get_emoji(action='report')} {hostname}: Suspending HA state of secondary-passive"
+                    f"{get_emoji(action='report')} {hostname}: Suspending HA state of {local_state}"
                 )
-                suspend_ha_passive(
+                if not suspend_ha_passive(
                     target_device,
                     hostname,
-                )
+                ):
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                    )
+                    sys.exit(1)
 
             # log message to console
             else:
                 logging.info(
-                    f"{get_emoji(action='report')} {hostname}: Target device is secondary-passive, but we are in dry-run mode. Skipping HA state suspension.",
+                    f"{get_emoji(action='report')} {hostname}: Target device is {local_state}, but we are in dry-run mode. Skipping HA state suspension.",
                 )
 
             # Continue with upgrade process on the passive target device
@@ -599,6 +853,12 @@ def handle_panorama_ha(
             # Continue with upgrade process on the passive target device
             return True, None
 
+        else:
+            logging.error(
+                f"{get_emoji(action='error')} {hostname}: HA state is {local_state}, so the CLI won't upgrade it. If it was left suspended, run request high-availability state functional on it, then run it again."
+            )
+            sys.exit(1)
+
     elif version_comparison == "older":
 
         # log message to console
@@ -606,19 +866,45 @@ def handle_panorama_ha(
             f"{get_emoji(action='report')} {hostname}: Target device is on an older version"
         )
 
-        # Suspend HA state of active if the primary-active is on a later release
-        if local_state == "primary-active" and not dry_run:
+        # Suspend HA state of the active if its peer is already on the later release
+        if local_active:
 
-            # log message to console
-            logging.info(
-                f"{get_emoji(action='report')} {hostname}: Suspending HA state of primary-active"
-            )
+            # Suspending the active fails over to the peer, so the peer must be passive
+            if not peer_ready:
+                if dry_run:
+                    logging.warning(
+                        f"{get_emoji(action='warning')} {hostname}: HA peer is {peer_state}. A real run wouldn't suspend this active Panorama until the peer is passive. Continuing the dry run."
+                    )
+                    return True, None
+                if is_device_to_revisit:
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: HA peer not ready: the peer is {peer_state}, so it can't take over. Not suspending this active Panorama. Make the peer functional (request high-availability state functional), then run this Panorama again."
+                    )
+                    sys.exit(1)
+                defer_to_round_two(
+                    hostname=hostname,
+                    reason=f"its HA peer is {peer_state} and can't take over yet",
+                    target_device=target_device,
+                    target_devices_to_revisit=target_devices_to_revisit,
+                    target_devices_to_revisit_lock=target_devices_to_revisit_lock,
+                )
+                return False, None
 
-            # Suspend HA state of primary-active
-            suspend_ha_active(
-                target_device,
-                hostname,
-            )
+            if not dry_run:
+                # log message to console
+                logging.info(
+                    f"{get_emoji(action='report')} {hostname}: Suspending HA state of {local_state}"
+                )
+
+                # Suspend HA state of the active
+                if not suspend_ha_active(
+                    target_device,
+                    hostname,
+                ):
+                    logging.error(
+                        f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                    )
+                    sys.exit(1)
 
         return True, None
 
@@ -629,23 +915,29 @@ def handle_panorama_ha(
             f"{get_emoji(action='report')} {hostname}: Target device is on a newer version"
         )
 
-        # Suspend HA state of secondary-passive if the primary-active is on a later release
-        if local_state == "primary-active" and not dry_run:
+        # Suspend HA state of the passive if the active is on an earlier release
+        if local_passive and not dry_run:
 
             # log message to console
             logging.info(
-                f"{get_emoji(action='report')} {hostname}: Suspending HA state of primary-active"
+                f"{get_emoji(action='report')} {hostname}: Suspending HA state of {local_state}"
             )
 
-            # Suspend HA state of primary-active
-            suspend_ha_passive(
+            if not suspend_ha_passive(
                 target_device,
                 hostname,
-            )
+            ):
+                logging.error(
+                    f"{get_emoji(action='error')} {hostname}: Failed to suspend HA state, so the upgrade stops here before making changes."
+                )
+                sys.exit(1)
 
         return True, None
 
-    return False, None
+    logging.error(
+        f"{get_emoji(action='error')} {hostname}: Couldn't compare its version ({local_version}) with its HA peer's ({peer_version}). Not upgrading it."
+    )
+    sys.exit(1)
 
 
 def suspend_ha_active(
@@ -698,10 +990,12 @@ def suspend_ha_active(
 
         response_message = flatten_xml_to_dict(suspension_response)
 
-        if response_message["result"] == "Successfully changed HA state to suspended":
+        if response_message.get("result") == "Successfully changed HA state to suspended":
             logging.info(
                 f"{get_emoji(action='success')} {hostname}: Active target device HA state suspended."
             )
+            with _suspended_by_run_lock:
+                _suspended_by_run.add(device_key(target_device))
             return True
         else:
             logging.error(
@@ -766,10 +1060,12 @@ def suspend_ha_passive(
 
         response_message = flatten_xml_to_dict(suspension_response)
 
-        if response_message["result"] == "Successfully changed HA state to suspended":
+        if response_message.get("result") == "Successfully changed HA state to suspended":
             logging.info(
                 f"{get_emoji(action='success')} {hostname}: Passive target device HA state suspended."
             )
+            with _suspended_by_run_lock:
+                _suspended_by_run.add(device_key(target_device))
             return True
         else:
             logging.error(

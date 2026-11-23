@@ -13,6 +13,8 @@ Device lines look like "<emoji> <hostname>: <message>"; at DEBUG level they're p
 """
 
 # standard library imports
+import csv
+import io
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,6 +71,11 @@ SERIAL_LINE = re.compile(r"^Device (\d+) (downloading|installing) version: (\S+)
 # "Please confirm the selected firewalls:" list
 SELECTED_LINE = re.compile(r"^\s+- (\S+) \(([^)]*)\)\s*$")
 EXCEPTION_LINE = re.compile(r"^(?:Firewall|Panorama) (\S+) generated an exception: (.*)$")
+# The batch command's note that a device's thread stopped (it names the serial number or address)
+STOPPED_LINE = re.compile(r"^(?:Firewall|Panorama) (\S+) stopped \(exit code (\S+)\)\.$")
+
+# Generic lines the CLI logs after the one that says why a device stopped
+FOLLOW_UP_MESSAGES = ("Halting script", "Image not downloaded, exiting")
 
 WARNING_EMOJI = "\U0001f7e7"  # 🟧
 ERROR_EMOJI = "❌"  # ❌
@@ -76,6 +83,10 @@ STOP_EMOJI = "\U0001f6d1"  # 🛑
 
 # (substring, stage) checked in order; the first match sets the device's stage
 STAGE_RULES = [
+    ("HA state to functional", None),  # restoring HA after the reboot, or when an upgrade stops
+    ("HA state restored", None),
+    ("Upgrade completed without a snapshot comparison", "Post-checks"),
+    ("Skipping the snapshot comparison", "Post-checks"),
     ("Waiting for the device to become ready for the post upgrade snapshot", "Post-checks"),
     ("Snapshot comparison", "Post-checks"),
     ("Rebooting the target device", "Reboot"),
@@ -89,6 +100,9 @@ STAGE_RULES = [
     ("Performing readiness checks", "Readiness"),
     ("Readiness Check", "Readiness"),
     ("Performing snapshot of network state", "Snapshot"),
+    ("Snapshot attempt", "Snapshot"),
+    ("Failed to create snapshot", "Snapshot"),
+    ("Snapshot failed", "Snapshot"),
     ("network state snapshot", "Snapshot"),
     ("Network snapshot", "Snapshot"),
     ("Performing test to see if", "Download"),
@@ -99,6 +113,9 @@ STAGE_RULES = [
     ("is not on the target device", "Download"),
     ("already on target device", "Download"),
     ("disk space check", "Download"),
+    ("Download attempt", "Download"),
+    ("Download failed", "Download"),
+    ("download status", "Download"),
     ("Suspending", "HA suspend"),
     ("HA state suspended", "HA suspend"),
 ]
@@ -125,6 +142,7 @@ class Device:
     current_version: str = ""
     target_version: str = ""
     peer_version: str = ""
+    peer_state: str = ""
     ha_suspended: bool = False
     rebooted: bool = False
     reached: set = field(default_factory=set)  # stages the device has been through
@@ -210,10 +228,8 @@ class DeviceTracker:
             elif device.status == "deferred":
                 device.status = "not_upgraded"
                 device.problem = device.problem or (
-                    "Deferred again in round 2: its HA peer still runs the same version, so the peer wasn't "
-                    "upgraded. Check the peer's result." if device.round == 2 else
-                    "Round 2 didn't run. A dry run, or another device stopping the run in round 1, "
-                    "ends the run before deferred active members are upgraded."
+                    "Round 2 started but this device's upgrade didn't finish. Check its log." if device.round == 2 else
+                    "Round 2 didn't run: the run ended before deferred active members were upgraded."
                 )
             elif device.status == "queued":
                 device.status = "not_upgraded"
@@ -265,10 +281,19 @@ class DeviceTracker:
             return
         exception = EXCEPTION_LINE.match(message)
         if exception:
-            device = self._device(exception.group(1), when)
+            device = self._device(self._resolve(exception.group(1)), when)
             device.errors += 1
             self._fail(device, f"Exception: {exception.group(2)}")
             self._update(device, None, message, text, when)
+            return
+        stopped = STOPPED_LINE.match(message)
+        if stopped:
+            # The device logged why it stopped; this only settles devices that didn't say
+            device = self.devices.get(self._resolve(stopped.group(1)))
+            if device:
+                if device.status not in TERMINAL:
+                    self._fail(device, f"Stopped during {device.stage.lower()} (exit code {stopped.group(2)}).")
+                self._update(device, None, message, text, when)
             return
         if host in self.controllers:
             return
@@ -299,6 +324,15 @@ class DeviceTracker:
         self._outcome(device, emoji, message)
         self._update(device, stage, message, text, when)
 
+    def _resolve(self, name: str) -> str:
+        """Device hostname for a serial number or address the batch command logged."""
+        if name in self.serials:
+            return self.serials[name]
+        for device in self.devices.values():
+            if name in (device.ip, device.serial):
+                return device.hostname
+        return name
+
     def _facts(self, device: Device, message: str):
         """Versions, HA role and other details stated in a message."""
         if re.fullmatch(r"\d{6,} .*", message):
@@ -317,8 +351,12 @@ class DeviceTracker:
             device.role, device.current_version, device.peer_version = local.groups()
         elif upgrade := re.match(r"Upgrade required from (\S+) to (\S+)", message):
             device.current_version, device.target_version = upgrade.groups()
+        elif message.startswith("HA peer state: "):
+            device.peer_state = message.removeprefix("HA peer state: ").strip()
         elif "HA state suspended" in message:
             device.ha_suspended = True
+        elif message.startswith("HA state restored to functional"):
+            device.ha_suspended = False
         elif "Device rebooted to the target version successfully" in message:
             device.rebooted = True
         elif "report saved to " in message or (self.kind == "backup" and " saved to " in message):
@@ -342,8 +380,11 @@ class DeviceTracker:
         elif "No upgrade required or downgrade attempt detected" in message:
             device.status = "skipped"
             device.problem = "Already on the target version or newer."
-        elif message.startswith("Backup completed") or "Snapshot comparison PDF report saved" in message or (
-            device.rebooted and "Snapshots are disabled" in message
+        elif (
+            message.startswith("Backup completed")
+            or "Snapshot comparison PDF report saved" in message
+            or "Upgrade completed without a snapshot comparison" in message
+            or (device.rebooted and "Snapshots are disabled" in message)
         ):
             device.status = "completed"
         elif emoji.startswith(STOP_EMOJI) or any(
@@ -358,10 +399,17 @@ class DeviceTracker:
                 "Panorama does not have an active license",
                 "No IP address found for the peer",
                 "Configuration backup failed",
+                "Download failed after",
+                "Snapshot failed:",
+                "HA peer not ready",
+                "HA peer not upgraded",
+                "so the CLI won't upgrade it",
+                "Couldn't compare its version",
             )
         ):
-            # "Halting script." follows the line that explains why; keep the explanation
-            if not (message.startswith("Halting script") and device.problem):
+            # "Halting script." and "Image not downloaded, exiting." follow the line that explains
+            # why; keep the explanation
+            if not (message.startswith(FOLLOW_UP_MESSAGES) and device.status == "failed" and device.problem):
                 self._fail(device, message)
         elif device.status in ("queued", "deferred") and "revisit" not in message:
             device.status = "running"
@@ -404,5 +452,52 @@ class DeviceTracker:
         return f"{len(self.devices)} devices: " + ", ".join(parts)
 
     def suspended(self) -> list[str]:
-        """Devices this run put into HA suspended state. The CLI never restores them."""
+        """Devices this run put into HA suspended state that weren't made functional again."""
         return [d.hostname for d in self.devices.values() if d.ha_suspended]
+
+    def needs_attention(self) -> list[str]:
+        """Hostnames of devices that failed, weren't upgraded or were interrupted, in run order."""
+        attention = STATUS_GROUPS["attention"][1]
+        return [d.hostname for d in self.devices.values() if d.status in attention]
+
+    def export_rows(self) -> list[dict]:
+        """One row per device with the run's results, for a spreadsheet."""
+        rows = []
+        for d in self.devices.values():
+            rows.append({
+                "Device": d.hostname,
+                "IP address": d.ip,
+                "Serial": d.serial,
+                "HA role": d.role,
+                "HA peer state": d.peer_state,
+                "Round": d.round,
+                "Status": STATUSES[d.status][0],
+                "Stage": d.stage,
+                "Current version": d.current_version,
+                "Target version": d.target_version,
+                "Peer version": d.peer_version,
+                "HA left suspended": "Yes" if d.ha_suspended else "No",
+                "Warnings": d.warnings,
+                "Errors": d.errors,
+                "Problem": d.problem,
+                "Latest activity": d.activity,
+                "Started": f"{d.started:%Y-%m-%d %H:%M:%S}" if d.started else "",
+                "Last update": f"{d.updated:%Y-%m-%d %H:%M:%S}" if d.updated else "",
+                "Reports": "; ".join(d.reports),
+            })
+        return rows
+
+    def to_csv(self) -> str:
+        """export_rows() as CSV text, which Excel opens directly."""
+        rows = self.export_rows()
+        out = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(out, fieldnames=list(rows[0]), lineterminator="\r\n")
+            writer.writeheader()
+            for row in rows:
+                # Keep Excel from running a cell that starts like a formula
+                writer.writerow({
+                    k: ("'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@") else v)
+                    for k, v in row.items()
+                })
+        return out.getvalue()

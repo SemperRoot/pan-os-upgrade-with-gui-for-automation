@@ -253,10 +253,10 @@ window, run:
 gui\.venv\Scripts\python.exe gui\smoke_test.py
 ```
 
-**You should see** six lines starting with `PASS`, ending with:
+**You should see** seven lines starting with `PASS`, ending with:
 
 ```
-6 of 6 checks passed.
+7 of 7 checks passed.
 ```
 
 One check briefly tries to reach `192.0.2.1`. That address is reserved for documentation and never
@@ -305,6 +305,11 @@ browser doesn't open by itself.
 
 ## Updating to a newer version
 
+**Running the setup again (step 5) is required.** The setup copies the upgrade tool into
+`.venv-cli`; until it runs again, the GUI keeps using the old copy. The GUI shows a red warning
+when that happens. Read [WHATS_NEW.md](WHATS_NEW.md) and [UPGRADING.md](UPGRADING.md) for the
+release you're installing first: they say what changed and whether anything else is needed.
+
 Your settings, inventory, run history, reports and backups are all in `gui\workspace` and are kept.
 
 1. Download and unblock the new ZIP as in [Part 2](#part-2-get-the-project).
@@ -312,7 +317,10 @@ Your settings, inventory, run history, reports and backups are all in `gui\works
 3. Extract the new ZIP to `C:\` and rename the new folder to `pan-os-upgrade`.
 4. Move the `workspace` folder from `C:\pan-os-upgrade-old\gui` into `C:\pan-os-upgrade\gui`.
 5. Run the setup again ([Part 3](#part-3-run-the-setup)) with the same command as before. For an
-   offline install, make a new `wheelhouse` folder for the new version first.
+   offline install, make a new `wheelhouse` folder for the new version first, unless
+   [UPGRADING.md](UPGRADING.md) says the packages haven't changed.
+6. Run the check in [Part 4](#part-4-check-the-installation). **CLI matches the project files**
+   must say `PASS`.
 
 Once the new version works, you can delete `C:\pan-os-upgrade-old`.
 
@@ -363,6 +371,7 @@ configuration backups, settings and the inventory. Open that folder in File Expl
 |--------------|------------|
 | `The system cannot find the path specified` | The setup didn't finish. Run it again (Part 3) and check that it ends with **Setup complete**. |
 | `FAIL  CLI is installed` or `FAIL  CLI starts` | Run the setup again. If it still fails, copy the lines under the `FAIL` line and send them to the project owner. |
+| `FAIL  CLI matches the project files` | The project files are newer than the installed upgrade tool. Close the GUI and run the setup again (Part 3) with the same command as before. |
 | `FAIL  GUI web server starts` | Another program may be using the port. Close other copies of the GUI and run the check again. |
 | Any other `FAIL` | Copy the whole output and send it to the project owner. |
 
